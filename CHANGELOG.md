@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.0 – Aufnahmeserien
+
+Eine Nacht läuft von 12 bis 12 Uhr. Für Lights ist das die richtige Einheit,
+für Kalibrierungs-Frames ist sie zu grob: Flats vom 14.08. um 18:54 und Flats
+vom 15.08. um 06:12 sind nach dieser Regel **dieselbe Nacht** und wurden
+deshalb zu einem einzigen Satz zusammengefasst – auch wenn es zwei getrennte
+Aufnahmeläufe für zwei verschiedene Nächte sind.
+
+* **Serien-Erkennung**: Frames werden zusätzlich zur Nacht in Serien
+  aufgeteilt – zusammenhängende Läufe, getrennt an Lücken über einem
+  einstellbaren Schwellwert (Standard **2 h**, in den Pipeline-Optionen).
+* Jede Serie ist eine eigene, auswählbare Quelle (`batch:`-IDs mit dem
+  Startzeitpunkt als Schlüssel). Damit bekommt jede Nacht ihren eigenen
+  Flat-Satz.
+* **Nichts wird weggenommen**: die Einträge für die ganze Nacht bleiben, und
+  Serien-Einträge entstehen nur dort, wo eine Gruppe tatsächlich zerfällt.
+  Projekte mit einem einzigen Aufnahmelauf sehen exakt dieselbe Liste wie
+  vorher.
+* **Baumansicht**: unterhalb von Filter bzw. Belichtungszeit erscheint eine
+  Serien-Ebene (`🕘 Series 2026-08-14 18:54 – 18:58`), sobald sich eine Gruppe
+  aufteilt. Damit ist auf den ersten Blick sichtbar, dass es zwei Läufe sind.
+* **Assistent**:
+  * schlägt die zeitlich nächstgelegene Serie vor statt der ganzen Nacht
+  * neue Spalte **Flat-Abstand** zeigt pro Nacht, wie weit die gewählte Serie
+    von den Lights entfernt ist (grün / orange / rot)
+  * Schritt 2 listet Aufnahmeserien statt Nächte
+  * die Plausibilitätsprüfung misst jetzt den **Zeitabstand von Intervall zu
+    Intervall** statt Kalendertage zu vergleichen; über Nacht-Schlüssel liessen
+    sich zwei Serien derselben Nacht gar nicht unterscheiden. Die Toleranz ist
+    dadurch in Stunden angegeben (Standard **24 h**), was die Fälle sauber
+    trennt: Flats vom nächsten Abend passen, Flats von übermorgen nicht.
+* Flat-Zuordnungen werden anhand der Quellen-ID gespeichert. Vorher teilten
+  sich zwei Serien derselben Nacht einen Gruppenschlüssel und hätten sich
+  gegenseitig überschrieben.
+* Master aus Serien tragen den Serien-Zeitpunkt im Dateinamen und können sich
+  dadurch nicht überschreiben.
+* Testsuite auf 117 Tests erweitert, davon 29 rund um Serien – aufgebaut auf
+  genau dem Datensatz aus der Fehlermeldung.
+
 ## 1.2.0 – Assistent
 
 ### Neu: optionaler Kalibrierungs-Assistent

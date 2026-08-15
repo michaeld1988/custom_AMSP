@@ -19,7 +19,36 @@ AMSP baut aus `DATE-OBS` einen „Session"-Schlüssel (Nacht von 12 Uhr bis
 Die Flats sind der kritische Punkt: Ohne Treffer in derselben Nacht werden die
 Lights **ohne Flat** kalibriert – ohne Fehlermeldung, nur eine Zeile im Log.
 
-## 2. Quellen und ihre IDs
+## 2. Aufnahmeserien
+
+Der Nacht-Schlüssel läuft von 12 bis 12 Uhr. Für Lights ist das genau richtig,
+für Kalibrierungs-Frames zu grob:
+
+```
+Flats 2026-08-14 18:54  ->  Nacht 2026-08-14
+Flats 2026-08-15 06:12  ->  Nacht 2026-08-14     <- dieselbe Nacht!
+```
+
+Beide Läufe fallen in dasselbe Fenster und würden zu einem Master verschmolzen,
+obwohl es zwei getrennte Aufnahmen für zwei verschiedene Nächte sind.
+
+Deshalb werden Frames zusätzlich in **Serien** geteilt: sortiert nach
+`DATE-OBS`, getrennt an jeder Lücke über dem Schwellwert
+(`cluster_by_time`, Standard 2 h, einstellbar in den Pipeline-Optionen).
+
+* Serien-Einträge entstehen nur, wenn eine Gruppe tatsächlich zerfällt
+  (mindestens 2, höchstens 24 Serien) – sonst bleibt die Liste wie bisher.
+* Frames ohne brauchbares `DATE-OBS` landen in einer eigenen letzten Serie und
+  gehen nie verloren.
+* Die Serien-ID enthält den Startzeitpunkt und ist damit über Neustarts hinweg
+  stabil, solange die Frames dieselben bleiben.
+
+Geprüft wird der **Zeitabstand von Intervall zu Intervall**
+(`interval_gap_hours`): 0 h bei Überlappung, sonst der Abstand von Ende zu
+Anfang. Über Nacht-Schlüssel wäre das nicht möglich – zwei Serien derselben
+Nacht hätten denselben Schlüssel.
+
+## 3. Quellen und ihre IDs
 
 Custom AMSP zählt beim Öffnen des Dialogs alle möglichen Quellen auf
 (`enumerate_cal_sources`). Jede bekommt eine stabile ID:
@@ -38,12 +67,13 @@ Beispiele:
 | `subs:dark:*:300s` | `Dark subs · all nights · 300s · 40 frames` |
 | `subs:dark:2026-01-05:300s` | `Dark subs · 2026-01-05 · 300s · 20 frames` |
 | `subs:flat:2026-03-25:Ha` | `Flat subs · 2026-03-25 · Ha · 25 frames` |
+| `batch:flat:2026-08-14T18:54:nofilter` | `Flat subs · 2026-08-14 18:54 – 18:58 · no filter · 30 frames` |
 | `file:/data/lib/masterdark_300s.fit` | `Master · masterdark_300s.fit · 300s` |
 
 Pro-Nacht-Einträge erscheinen nur, wenn es mehr als eine Nacht gibt – bei einer
 einzigen Nacht wäre der Eintrag identisch mit dem gepoolten.
 
-## 3. Der Dialog
+## 4. Der Dialog
 
 **Reiter „Lights"** – eine Zeile pro Gruppe aus Objekt × Nacht × Filter ×
 Belichtungszeit, mit je einer Auswahl für Bias, Dark und Flat.
@@ -60,7 +90,7 @@ Hilfsschaltflächen:
   Projekt gilt.
 * **Reset tab to Auto** – Reiter zurücksetzen.
 
-## 4. Auflösungsreihenfolge in der Engine
+## 5. Auflösungsreihenfolge in der Engine
 
 Für jede Gruppe und jede Kalibrierungsart (`_resolve_cal`):
 
@@ -79,7 +109,7 @@ Die Regel „ein Dark enthält den Bias bereits, also nie `-bias=` und `-dark=`
 zusammen an `calibrate` übergeben" gilt unverändert – sie wird nach der
 Auflösung angewendet, egal ob automatisch oder manuell zugeordnet.
 
-## 5. Wann werden zugeordnete Master gebaut?
+## 6. Wann werden zugeordnete Master gebaut?
 
 | Phase | Automatik | Zusätzlich |
 |---|---|---|
@@ -97,7 +127,7 @@ Frames werden nicht doppelt gestackt: Wenn eine „all nights"-Quelle nur Frames
 aus einer einzigen Nacht enthält, wird das bereits gebaute Master dieser Nacht
 wiederverwendet (`↻` im Log).
 
-## 6. Beispiel-Workflows
+## 7. Beispiel-Workflows
 
 ### Flats vom nächsten Nachmittag
 
@@ -120,6 +150,19 @@ einem Ordner.
   `External · masterdark_300s.fit` – damit entfällt jede Toleranzrechnung über
   Belichtungszeit und Temperatur.
 
+### Zwei Flat-Läufe, zwei Nächte
+
+Flats liegen in einem Ordner, aufgenommen am Abend des 14. und am Morgen des
+15. Beide gehören zum selben Nacht-Schlüssel.
+
+1. Alles laden – die Baumansicht zeigt unter *Flats* zwei
+   `🕘 Series`-Knoten.
+2. Assistent öffnen, Schritt 3. In der Flat-Spalte steht pro Nacht bereits die
+   zeitlich nächstgelegene Serie, daneben der Abstand.
+3. Bei Bedarf umstellen: jede Nacht bekommt die Serie, die zu ihr gehört.
+
+Ohne Serien-Ebene stünde hier nur „alle 60 Flats dieser Nacht" zur Auswahl.
+
 ### Zwei Setups in einer Nacht
 
 Beide Setups liefern Lights derselben Nacht, aber jeweils eigene Flats.
@@ -137,7 +180,7 @@ Wenn die Kamera-Uhr falsch stand, ist die Nacht-Spalte unbrauchbar. Dann:
 
 Damit stammt keine einzige Zuordnung mehr aus einem Datum.
 
-## 7. Der Assistent
+## 8. Der Assistent
 
 Der Assistent (Knopf **🧙 Assistent**) ist eine geführte Oberfläche für genau
 dieselben Zuordnungen. Er schreibt am Ende in dieselben Tabellen, die in
@@ -154,16 +197,18 @@ Unterschiede zum Dialog:
 
 ### Prüfungen im Detail
 
+**Flat-Abstand (Standard 24 h).** Der Zeitabstand zwischen der gewählten
+Flat-Serie und den Lights der Nacht, gemessen von Intervall zu Intervall. Die
+Spalte *Flat-Abstand* in Schritt 3 zeigt ihn laufend an: grün bis 12 h, orange
+bis zur Toleranz, rot darüber. Eine Flat-Serie am Morgen nach der Nacht liegt
+wenige Stunden entfernt, eine Serie zwei Tage später fällt heraus.
+
 **Belichtungszeit (Standard ±5 s).** Verglichen wird die häufigste
 Belichtungszeit der Lights einer Nacht mit der des zugeordneten Darks, und die
 häufigste Belichtungszeit der Flats mit der des zugeordneten Dark-Flats. Liegt
 die Abweichung über der Toleranz, erscheint eine Warnung mit beiden Werten.
 
-**Flat-Datum (Standard ±1 Tag).** Verglichen werden die Nacht-Schlüssel. Weil
-der Schlüssel von 12 bis 12 Uhr läuft, ist ein Flat vom Nachmittag nach der
-Nacht genau einen Tag entfernt und damit in Ordnung; ein Flat zwei Tage später
-wird gemeldet. Fehlt `DATE-OBS`, wird das ebenfalls gemeldet, statt die Prüfung
-still zu überspringen.
+Fehlt `DATE-OBS`, wird das gemeldet, statt die Prüfung still zu überspringen.
 
 Warnungen sind keine Sperre: Wer weiß, dass der optische Aufbau unverändert
 war, hakt „Warnungen geprüft" an und übernimmt.
@@ -182,7 +227,7 @@ Umgestuft werden nur Rohframes, deren Header `dark`, `flat`, `bias` oder
 das Abschalten der Regel stellt ihn wieder her. Geprüft wird ausschließlich der
 Dateiname, nie der Ordnername.
 
-## 8. Speicherung
+## 9. Speicherung
 
 Die Zuordnungen landen in der Konfigurationsdatei:
 

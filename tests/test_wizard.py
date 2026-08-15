@@ -351,7 +351,7 @@ class TestWizardValidation(WizardCase):
         w._goto(3)
         self.assertTrue([m for m in self._messages(w, 'warn')
                          if m.startswith('Flat')])
-        w._spin_date_tol.setValue(10)
+        w._spin_date_tol.setValue(200.0)   # hours, not days
         self.assertFalse([m for m in self._messages(w, 'warn')
                           if m.startswith('Flat')])
 
