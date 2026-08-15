@@ -137,7 +137,52 @@ Wenn die Kamera-Uhr falsch stand, ist die Nacht-Spalte unbrauchbar. Dann:
 
 Damit stammt keine einzige Zuordnung mehr aus einem Datum.
 
-## 7. Speicherung
+## 7. Der Assistent
+
+Der Assistent (Knopf **🧙 Assistent**) ist eine geführte Oberfläche für genau
+dieselben Zuordnungen. Er schreibt am Ende in dieselben Tabellen, die in
+Abschnitt 4 aufgelöst werden – es gibt keinen zweiten Codepfad.
+
+Unterschiede zum Dialog:
+
+| | Dialog | Assistent |
+|---|---|---|
+| Granularität | Light-Gruppe (Objekt × Nacht × Filter × Belichtung) | Nacht (wird beim Übernehmen auf alle Gruppen der Nacht ausgerollt) |
+| Vorauswahl | „Auto" | konkrete Quelle, sichtbar in der Zeile |
+| Dark-Flat | im Reiter *Flats* pro Flat-Gruppe | eigene Spalte pro Nacht, landet auf der Flat-Gruppe der gewählten Flats |
+| Prüfung | keine | Belichtungszeit und Datum, mit Bestätigungspflicht |
+
+### Prüfungen im Detail
+
+**Belichtungszeit (Standard ±5 s).** Verglichen wird die häufigste
+Belichtungszeit der Lights einer Nacht mit der des zugeordneten Darks, und die
+häufigste Belichtungszeit der Flats mit der des zugeordneten Dark-Flats. Liegt
+die Abweichung über der Toleranz, erscheint eine Warnung mit beiden Werten.
+
+**Flat-Datum (Standard ±1 Tag).** Verglichen werden die Nacht-Schlüssel. Weil
+der Schlüssel von 12 bis 12 Uhr läuft, ist ein Flat vom Nachmittag nach der
+Nacht genau einen Tag entfernt und damit in Ordnung; ein Flat zwei Tage später
+wird gemeldet. Fehlt `DATE-OBS`, wird das ebenfalls gemeldet, statt die Prüfung
+still zu überspringen.
+
+Warnungen sind keine Sperre: Wer weiß, dass der optische Aufbau unverändert
+war, hakt „Warnungen geprüft" an und übernimmt.
+
+### Dark-Flats am Dateinamen
+
+Erkennungsmuster (Groß-/Kleinschreibung egal, Trenner optional
+`_`, `-`, `.`, Leerzeichen):
+
+```
+dark[trenner]flat        flat[trenner]dark
+```
+
+Umgestuft werden nur Rohframes, deren Header `dark`, `flat`, `bias` oder
+`unknown` sagt – ein Light bleibt ein Light. Der vorherige Typ wird gemerkt,
+das Abschalten der Regel stellt ihn wieder her. Geprüft wird ausschließlich der
+Dateiname, nie der Ordnername.
+
+## 8. Speicherung
 
 Die Zuordnungen landen in der Konfigurationsdatei:
 
