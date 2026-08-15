@@ -37,6 +37,12 @@ This fork adds an explicit assignment layer on top of the automatic one:
     applied instead of being matched by date.
   * Master/sub override in the context menu, for calibration masters whose
     header carries no STACKCNT.
+  * An optional four-step wizard: load the lights (or one folder holding
+    everything), load whatever calibration is missing, assign per night with
+    "apply to all nights" per kind, then check exposure times (±5 s) and flat
+    dates (a flat from the 15th does not belong to the night of the 13th)
+    before anything is applied.  Dark flats are additionally recognised from
+    the file name (darkflat / dark_flat / dark-flat / flat_dark / …).
 
 Pipeline:
   Phase 1 – Master Bias    : per session (skip if pre-existing master found)
@@ -46,9 +52,20 @@ Pipeline:
              calibrate all sessions → register → stack → clean up before next group
   Phase 5 – Cross-stack Alignment: align stacks of the same object across filters
 
-  version 1.1.0  (fork of upstream AMSP 1.0.17)
+  version 1.2.0  (fork of upstream AMSP 1.0.17)
 
   Custom AMSP changes
+  1.2.0  Optional calibration wizard (button "Assistent"):
+         - step 1 loads the lights by drop or folder and reports the nights
+         - step 2 takes the remaining calibration frames; dark flats are also
+           detected from the file name (darkflat / dark_flat / dark-flat /
+           dark.flat / "dark flat" and the same with the words swapped)
+         - step 3 assigns per night, with one "apply to all nights" button
+           per calibration kind and a pre-filled, concrete suggestion
+         - step 4 checks exposure times (default ±5 s, adjustable) and flat
+           dates (default ±1 day) and requires warnings to be confirmed
+         - the result feeds the same assignment tables as the dialog, so the
+           wizard is a front-end and never a second code path
   1.1.0  Manual calibration assignment:
          - every calibration source (raw sub group, pre-existing master,
            external file, synthetic bias) gets a stable source ID that does
@@ -113,6 +130,7 @@ Pipeline:
 
 import json
 import os
+import re
 import sys
 import shutil
 import time as _time
@@ -135,7 +153,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QFileDialog, QSizePolicy,
     QDialog, QCheckBox, QDialogButtonBox, QDoubleSpinBox,
     QAbstractItemView, QMenu,
-    QTabWidget, QTableWidget, QTableWidgetItem, QComboBox
+    QTabWidget, QTableWidget, QTableWidgetItem, QComboBox,
+    QStackedWidget, QSpinBox
 )
 from PyQt6.QtGui import QFont, QColor, QDragEnterEvent, QDropEvent
 from sirilpy import LogColor
@@ -147,7 +166,7 @@ from astropy.io import fits as astrofits
 # =============================================================================
 
 APP_NAME         = "Custom AMSP – Multi-Session Processing"
-VERSION          = "1.1.0"
+VERSION          = "1.2.0"
 FITS_SUFFIXES    = {'.fits', '.fit', '.fts'}
 FITS_FZ_SUFFIXES = {'.fits.fz', '.fit.fz', '.fts.fz'}
 FITS_EXTS      = tuple(FITS_SUFFIXES | FITS_FZ_SUFFIXES)
@@ -240,7 +259,6 @@ def _safe_name(filt: str) -> str:
     Replaces or strips characters that are problematic on any OS or
     that would break Siril command parsing (apostrophes, quotes, etc.).
     """
-    import re
     safe = (filt
             .replace(NO_FILTER, 'nofilter')
             # Apostrophes / quotes break shell-like command parsing
@@ -317,6 +335,56 @@ def _infer_imgtype_from_content(h) -> str:
     if flt and obj:
         return 'light'
     return 'unknown'
+
+# Dark flats are the type capture software gets wrong most often: many
+# programs write IMAGETYP=Dark (or nothing useful) and only the file name
+# says what the frames really are.  Matches darkflat / dark_flat / dark-flat /
+# dark flat / dark.flat and the same four with the words swapped.
+DARKFLAT_NAME_RE = re.compile(r'(dark[ _.\-]?flat|flat[ _.\-]?dark)', re.IGNORECASE)
+
+
+def name_suggests_darkflat(name: str) -> bool:
+    """True when the *file name* (not the folder) marks a frame as a dark flat."""
+    return bool(DARKFLAT_NAME_RE.search(Path(name).name))
+
+
+def apply_darkflat_name_hints(infos: list[dict]) -> list[dict]:
+    """
+    Retype frames whose file name says "dark flat" but whose header does not.
+
+    Only sub frames are touched, and only when the header type is one a dark
+    flat is plausibly mis-detected as (dark, flat, bias or unknown) — a frame
+    the header calls a light is never reinterpreted from its name.
+
+    Returns the list of infos that were changed (already modified in place).
+    """
+    changed: list[dict] = []
+    for fi in infos:
+        if fi.get('is_master') or fi.get('imgtype') == 'darkflat':
+            continue
+        if fi.get('imgtype') not in ('dark', 'flat', 'bias', 'unknown'):
+            continue
+        if name_suggests_darkflat(fi['name']):
+            fi['imgtype_before_hint'] = fi['imgtype']
+            fi['imgtype'] = 'darkflat'
+            changed.append(fi)
+    return changed
+
+
+def session_delta_days(a: str, b: str) -> Optional[int]:
+    """
+    Signed distance in days between two session keys (b - a).
+
+    None when either side is the unknown-date placeholder, so callers can tell
+    "no date information" apart from "same night".
+    """
+    try:
+        d_a = datetime.strptime(a, '%Y-%m-%d')
+        d_b = datetime.strptime(b, '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+    return (d_b - d_a).days
+
 
 def night_key(date_obs: str) -> str:
     """Noon-to-noon observation night as YYYY-MM-DD."""
@@ -2212,24 +2280,27 @@ class DropZone(QFrame):
     _HOVER = ('DropZone { border: 2px dashed #5BA3FF; border-radius: 14px;'
               ' background-color: #1a2640; } QLabel { color: #ffffff; }')
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None,
+                 title: str = 'Drop FITS files or folders here',
+                 subtitle: str = 'Accepted: .fits  .fit  .fts  .fits.fz  (any case)',
+                 min_height: int = 100):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setMinimumHeight(100)
+        self.setMinimumHeight(min_height)
         self.setStyleSheet(self._IDLE)
         lay = QVBoxLayout(self)
         lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.setSpacing(4)
         icon  = QLabel('📂'); icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         fi = QFont(); fi.setPointSize(24); icon.setFont(fi)
-        title = QLabel('Drop FITS files or folders here')
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ft = QFont(); ft.setPointSize(11); ft.setBold(True); title.setFont(ft)
-        sub = QLabel('Accepted: .fits  .fit  .fts  .fits.fz  (any case)')
+        title_lbl = QLabel(title)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ft = QFont(); ft.setPointSize(11); ft.setBold(True); title_lbl.setFont(ft)
+        sub = QLabel(subtitle)
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         fs = QFont(); fs.setPointSize(8); sub.setFont(fs)
         sub.setStyleSheet('color: #666666;')
-        lay.addWidget(icon); lay.addWidget(title); lay.addWidget(sub)
+        lay.addWidget(icon); lay.addWidget(title_lbl); lay.addWidget(sub)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -2423,6 +2494,40 @@ class OptionsDialog(QDialog):
 # Calibration assignment dialog
 # =============================================================================
 
+def make_source_combo(sources: list[CalSource], kinds: tuple[str, ...],
+                      current: Optional[str] = None,
+                      synthetic_bias: Optional[str] = None,
+                      include_auto: bool = True) -> QComboBox:
+    """
+    Drop-down over the calibration sources of the given kinds.
+
+    Shared by the assignment dialog and the wizard so both produce exactly the
+    same source IDs.  `synthetic_bias` not None adds the synthetic-bias entry
+    (pass '' to offer it with a hint that no expression is set yet).
+    """
+    cb = QComboBox()
+    if include_auto:
+        cb.addItem('Auto  (match by date / exposure)', SID_AUTO)
+    cb.addItem('None  (apply nothing)', SID_NONE)
+    if synthetic_bias is not None:
+        cb.addItem('Synthetic bias  ' + synthetic_bias if synthetic_bias
+                   else 'Synthetic bias  (no expression set yet)',
+                   SID_SYNTHETIC)
+    for src in sources:
+        if src.kind in kinds:
+            cb.addItem(src.label, src.sid)
+
+    idx = cb.findData(current) if current else 0
+    if idx < 0:
+        # A stored assignment whose file/group is not loaded right now stays
+        # selectable instead of silently reverting to Auto.
+        short = current.split(':')[-1] or current
+        cb.addItem(f'⚠ unavailable · {short}', current)
+        idx = cb.count() - 1
+    cb.setCurrentIndex(max(idx, 0))
+    return cb
+
+
 class CalibrationAssignmentDialog(QDialog):
     """
     Manual light ↔ calibration mapping.
@@ -2610,26 +2715,9 @@ class CalibrationAssignmentDialog(QDialog):
 
     def _make_combo(self, kinds: tuple[str, ...], current: Optional[str],
                     allow_synthetic: bool = False) -> QComboBox:
-        cb = QComboBox()
-        cb.addItem('Auto  (match by date / exposure)', SID_AUTO)
-        cb.addItem('None  (apply nothing)',            SID_NONE)
-        if allow_synthetic:
-            label = ('Synthetic bias  ' + self._synthetic_bias
-                     if self._synthetic_bias else
-                     'Synthetic bias  (set the expression in the main window)')
-            cb.addItem(label, SID_SYNTHETIC)
-        for src in self._sources:
-            if src.kind in kinds:
-                cb.addItem(src.label, src.sid)
-
-        idx = cb.findData(current) if current else 0
-        if idx < 0:
-            # Stored assignment whose file/group is not loaded right now –
-            # keep it selectable instead of silently reverting to Auto.
-            short = current.split(':')[-1] or current
-            cb.addItem(f'⚠ unavailable · {short}', current)
-            idx = cb.count() - 1
-        cb.setCurrentIndex(max(idx, 0))
+        cb = make_source_combo(
+            self._sources, kinds, current,
+            synthetic_bias=(self._synthetic_bias if allow_synthetic else None))
         cb.currentIndexChanged.connect(self._update_count)
         return cb
 
@@ -2682,6 +2770,808 @@ class CalibrationAssignmentDialog(QDialog):
 
         return {'lights': _collect(self._light_rows),
                 'flats':  _collect(self._flat_rows)}
+
+
+# =============================================================================
+# Calibration wizard
+# =============================================================================
+
+class CalibrationWizard(QDialog):
+    """
+    Optional step-by-step alternative to the assignment dialog.
+
+      1. Lights      – drop them (or a folder holding everything); the wizard
+                       reports which nights it found.
+      2. Calibration – whatever was not already picked up; dark flats are also
+                       recognised from the file name.
+      3. Assignment  – one row per night, with "apply to all nights" per kind.
+      4. Check       – exposure-time and date plausibility, then finish.
+
+    The result is written into the same assignment tables the engine already
+    consumes, so the wizard is a front-end and never a second code path.
+    """
+
+    PAGES = ['1 · Lights', '2 · Kalibrierung', '3 · Zuordnung', '4 · Prüfung']
+
+    # Defaults for the two plausibility checks the user asked for.
+    DEFAULT_EXP_TOL_S   = 5.0   # dark vs light exposure time
+    DEFAULT_DATE_TOL_D  = 1     # flat night vs light night
+
+    _TABLE_QSS = CalibrationAssignmentDialog._TABLE_QSS
+
+    def __init__(self, parent, all_infos: list[dict],
+                 external_darks: Optional[Path] = None,
+                 synthetic_bias: str = ''):
+        super().__init__(parent)
+        self.setWindowTitle('Custom AMSP – Kalibrierungs-Assistent')
+        self.setMinimumSize(1080, 700)
+
+        self._external_darks = external_darks
+        self._synthetic_bias = synthetic_bias.strip()
+        self._infos: list[dict] = list(all_infos)
+        self._sources: list[CalSource] = []
+        self._scan_thread: Optional[ScanThread] = None
+        self._retyped: list[dict] = []
+        # night → {kind: QComboBox}
+        self._night_rows: list[tuple[str, dict]] = []
+        # Whether the check page found something the user has to confirm.
+        # Kept as state rather than read back from the checkbox: isVisible()
+        # is False while the dialog itself has not been shown yet.
+        self._needs_confirm = False
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 12)
+
+        self._step_lbl = QLabel()
+        f = QFont(); f.setBold(True); f.setPointSize(12)
+        self._step_lbl.setFont(f)
+        root.addWidget(self._step_lbl)
+
+        self._hint_lbl = QLabel()
+        self._hint_lbl.setStyleSheet('color:#888899; font-size:9pt;')
+        self._hint_lbl.setWordWrap(True)
+        root.addWidget(self._hint_lbl)
+
+        self._stack = QStackedWidget()
+        root.addWidget(self._stack, stretch=1)
+        self._stack.addWidget(self._build_page_lights())
+        self._stack.addWidget(self._build_page_calibration())
+        self._stack.addWidget(self._build_page_assign())
+        self._stack.addWidget(self._build_page_check())
+
+        self._progress = QProgressBar()
+        self._progress.setFixedHeight(14)
+        self._progress.setVisible(False)
+        root.addWidget(self._progress)
+
+        nav = QHBoxLayout(); nav.setSpacing(8)
+        self._btn_cancel = QPushButton('Abbrechen')
+        self._btn_cancel.clicked.connect(self.reject)
+        self._btn_back = QPushButton('◀  Zurück')
+        self._btn_back.clicked.connect(lambda: self._goto(self._stack.currentIndex() - 1))
+        self._btn_next = QPushButton('Weiter  ▶')
+        self._btn_next.clicked.connect(lambda: self._goto(self._stack.currentIndex() + 1))
+        self._btn_finish = QPushButton('✓  Übernehmen')
+        self._btn_finish.clicked.connect(self._finish)
+        self._btn_finish.setStyleSheet(
+            'QPushButton { background:#1e6b2e; color:#ffffff; font-weight:bold;'
+            ' border:1px solid #2ecc71; border-radius:6px; padding:4px 14px; }'
+            'QPushButton:disabled { background:#1a1a1a; color:#444444;'
+            ' border:1px solid #2a2a2a; }')
+        for b in (self._btn_cancel, self._btn_back, self._btn_next, self._btn_finish):
+            b.setFixedHeight(30)
+        nav.addWidget(self._btn_cancel)
+        nav.addStretch()
+        nav.addWidget(self._btn_back)
+        nav.addWidget(self._btn_next)
+        nav.addWidget(self._btn_finish)
+        root.addLayout(nav)
+
+        # Files handed over from the main window have never been through the
+        # file-name rule, so apply it here rather than only after a drop.
+        self._reclassify_darkflats()
+        self._refresh_lights_page()
+        self._goto(0)
+
+    # ── Page 1: lights ───────────────────────────────────────────────────────
+
+    def _build_page_lights(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        drop = DropZone(
+            title='Lights hier ablegen',
+            subtitle='Einzelne Dateien, ein Ordner mit den Lights – oder gleich '
+                     'der Ordner mit allen Daten',
+            min_height=90)
+        drop.files_dropped.connect(self._add_paths)
+        lay.addWidget(drop)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        btn = QPushButton('📂  Ordner wählen …')
+        btn.setFixedHeight(28)
+        btn.clicked.connect(self._browse_folder)
+        row.addWidget(btn)
+        self._lights_status = QLabel('Noch keine Lights geladen.')
+        self._lights_status.setStyleSheet('color:#888899; font-size:9pt;')
+        row.addWidget(self._lights_status, stretch=1)
+        lay.addLayout(row)
+
+        self._lights_table = QTableWidget(0, 5)
+        self._lights_table.setHorizontalHeaderLabels(
+            ['Nacht', 'Objekt', 'Filter', 'Belichtung', 'Frames'])
+        self._prepare_table(self._lights_table)
+        lay.addWidget(self._lights_table, stretch=1)
+        return page
+
+    def _refresh_lights_page(self):
+        lights = [fi for fi in self._infos
+                  if not fi['is_master'] and fi['imgtype'] == 'light']
+        groups: dict = defaultdict(int)
+        for fi in lights:
+            groups[(fi['session'], fi.get('object_name') or 'unknown',
+                    fi['filter'], _exptime_key(fi.get('exptime')))] += 1
+
+        self._lights_table.setRowCount(len(groups))
+        for row, key in enumerate(sorted(groups)):
+            session, obj, filt, exp_key = key
+            for col, text in enumerate((session, obj, _filt_label(filt),
+                                        exp_key, str(groups[key]))):
+                self._lights_table.setItem(row, col, self._ro_cell(text))
+
+        nights = sorted({fi['session'] for fi in lights})
+        others = len([fi for fi in self._infos
+                      if fi['is_master'] or fi['imgtype'] != 'light'])
+        if lights:
+            extra = (f'  ·  {others} weitere Datei(en) bereits erkannt'
+                     if others else '')
+            self._lights_status.setText(
+                f'{len(lights)} Light(s) in {len(nights)} Nacht/Nächten: '
+                + ', '.join(nights) + extra)
+        else:
+            self._lights_status.setText('Noch keine Lights geladen.')
+        self._update_nav()
+
+    # ── Page 2: calibration frames ───────────────────────────────────────────
+
+    def _build_page_calibration(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        drop = DropZone(
+            title='Kalibrierungs-Frames hier ablegen',
+            subtitle='Bias, Darks, Flats, Dark-Flats – fertige Master oder Rohframes',
+            min_height=90)
+        drop.files_dropped.connect(self._add_paths)
+        lay.addWidget(drop)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        btn = QPushButton('📂  Ordner wählen …')
+        btn.setFixedHeight(28)
+        btn.clicked.connect(self._browse_folder)
+        row.addWidget(btn)
+        self._chk_darkflat_names = QCheckBox(
+            'Dark-Flats am Dateinamen erkennen  (darkflat, flat_dark, dark-flat …)')
+        self._chk_darkflat_names.setChecked(True)
+        self._chk_darkflat_names.setToolTip(
+            'Viele Programme schreiben für Dark-Flats IMAGETYP=Dark oder gar\n'
+            'nichts Brauchbares. Erkannt werden im Dateinamen:\n'
+            '  darkflat  dark_flat  dark-flat  dark.flat  "dark flat"\n'
+            'und dieselben vier mit vertauschten Wörtern.')
+        self._chk_darkflat_names.toggled.connect(self._reclassify_darkflats)
+        row.addWidget(self._chk_darkflat_names, stretch=1)
+        lay.addLayout(row)
+
+        self._retyped_lbl = QLabel()
+        self._retyped_lbl.setWordWrap(True)
+        self._retyped_lbl.setStyleSheet(
+            'color:#CC8844; font-size:9pt; border:1px solid #553311;'
+            ' border-radius:4px; padding:6px;')
+        self._retyped_lbl.setVisible(False)
+        lay.addWidget(self._retyped_lbl)
+
+        self._calib_table = QTableWidget(0, 4)
+        self._calib_table.setHorizontalHeaderLabels(
+            ['Art', 'Nacht', 'Details', 'Frames'])
+        self._prepare_table(self._calib_table)
+        lay.addWidget(self._calib_table, stretch=1)
+
+        self._calib_status = QLabel()
+        self._calib_status.setStyleSheet('color:#888899; font-size:9pt;')
+        lay.addWidget(self._calib_status)
+        return page
+
+    def _reclassify_darkflats(self):
+        """Apply (or undo) the file-name based dark-flat detection."""
+        if self._chk_darkflat_names.isChecked():
+            self._retyped = apply_darkflat_name_hints(self._infos)
+        else:
+            for fi in self._infos:
+                if 'imgtype_before_hint' in fi:
+                    fi['imgtype'] = fi.pop('imgtype_before_hint')
+            self._retyped = []
+        self._refresh_calibration_page()
+
+    def _refresh_calibration_page(self):
+        rows: list[tuple[str, str, str, int]] = []
+        counts: dict = defaultdict(int)
+        for fi in self._infos:
+            if fi['is_master'] or fi['imgtype'] == 'light':
+                continue
+            kind = fi['imgtype']
+            if kind == 'flat':
+                detail = _filt_label(fi['filter'])
+            elif kind in ('dark', 'darkflat'):
+                detail = _exptime_key(fi.get('exptime'))
+            else:
+                detail = ''
+            counts[(kind, fi['session'], detail)] += 1
+
+        for (kind, session, detail), n in sorted(counts.items()):
+            label = TYPE_INFO.get(kind, (kind, ''))[0]
+            rows.append((label, session, detail, n))
+
+        masters = [fi for fi in self._infos if fi['is_master']]
+        for fi in sorted(masters, key=lambda x: x['name']):
+            rows.append((MASTER_INFO[0], fi['session'],
+                         f'{fi["name"]}  ({fi["imgtype"]})', fi['stackcnt']))
+
+        self._calib_table.setRowCount(len(rows))
+        for row, (a, b, c, n) in enumerate(rows):
+            for col, text in enumerate((a, b, c, str(n))):
+                self._calib_table.setItem(row, col, self._ro_cell(text))
+
+        if self._retyped:
+            names = ', '.join(sorted(fi['name'] for fi in self._retyped)[:6])
+            more = '' if len(self._retyped) <= 6 else f' … (+{len(self._retyped) - 6})'
+            self._retyped_lbl.setText(
+                f'🌓🌑  {len(self._retyped)} Datei(en) anhand des Dateinamens als '
+                f'Dark-Flat eingestuft: {names}{more}')
+            self._retyped_lbl.setVisible(True)
+        else:
+            self._retyped_lbl.setVisible(False)
+
+        kinds = {fi['imgtype'] for fi in self._infos
+                 if not fi['is_master'] and fi['imgtype'] != 'light'}
+        missing = [name for key, name in (('bias', 'Bias'), ('dark', 'Darks'),
+                                          ('flat', 'Flats'))
+                   if key not in kinds and not any(
+                       fi['is_master'] and fi['imgtype'] == key
+                       for fi in self._infos)]
+        self._calib_status.setText(
+            'Keine Kalibrierungsdaten vorhanden.' if not rows else
+            (f'{len(rows)} Gruppe(n) erkannt.'
+             + (f'  Nicht vorhanden: {", ".join(missing)}.' if missing else '')))
+
+    # ── Page 3: per-night assignment ─────────────────────────────────────────
+
+    def _build_page_assign(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        self._assign_table = QTableWidget(0, 6)
+        self._assign_table.setHorizontalHeaderLabels(
+            ['Nacht', 'Lights', 'Bias', 'Dark', 'Dark-Flat', 'Flat'])
+        self._prepare_table(self._assign_table, stretch_from=2)
+        self._assign_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._assign_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        lay.addWidget(self._assign_table, stretch=1)
+
+        info = QLabel(
+            'Übernimmt den Wert der markierten Zeile (sonst der ersten) auf alle '
+            'Nächte – z. B. eine Dark-Bibliothek, die für jede Nacht gilt:')
+        info.setStyleSheet('color:#888899; font-size:9pt;')
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        for kind, label in (('bias', 'Bias'), ('dark', 'Darks'),
+                            ('darkflat', 'Dark-Flats'), ('flat', 'Flats')):
+            b = QPushButton(f'{label} auf alle Nächte')
+            b.setFixedHeight(26)
+            b.clicked.connect(lambda _, k=kind: self._apply_to_all_nights(k))
+            row.addWidget(b)
+        row.addStretch()
+        b_auto = QPushButton('↺  Vorschlag neu berechnen')
+        b_auto.setFixedHeight(26)
+        b_auto.setToolTip(
+            'Füllt alle Zeilen erneut mit dem besten Treffer:\n'
+            'Darks nach Belichtungszeit, Flats nach Filter und nächstgelegener\n'
+            'Nacht, Bias gepoolt über alle Nächte.')
+        b_auto.clicked.connect(lambda: self._fill_suggestions(force=True))
+        row.addWidget(b_auto)
+        lay.addLayout(row)
+        return page
+
+    def _refresh_assign_page(self):
+        """Rebuild the per-night rows, keeping choices the user already made."""
+        previous = {night: {k: cb.currentData() for k, cb in combos.items()}
+                    for night, combos in self._night_rows}
+        self._sources = enumerate_cal_sources(self._infos, self._external_darks)
+        nights = sorted({fi['session'] for fi in self._infos
+                         if not fi['is_master'] and fi['imgtype'] == 'light'})
+
+        self._night_rows = []
+        self._assign_table.setRowCount(len(nights))
+        for row, night in enumerate(nights):
+            n_lights = sum(1 for fi in self._infos
+                           if not fi['is_master'] and fi['imgtype'] == 'light'
+                           and fi['session'] == night)
+            self._assign_table.setItem(row, 0, self._ro_cell(night))
+            self._assign_table.setItem(row, 1, self._ro_cell(str(n_lights)))
+            stored = previous.get(night, {})
+            combos = {
+                'bias': make_source_combo(self._sources, ('bias',),
+                                          stored.get('bias'),
+                                          synthetic_bias=self._synthetic_bias),
+                'dark': make_source_combo(self._sources, ('dark',),
+                                          stored.get('dark')),
+                'darkflat': make_source_combo(self._sources,
+                                              ('darkflat', 'dark', 'bias'),
+                                              stored.get('darkflat'),
+                                              synthetic_bias=self._synthetic_bias),
+                'flat': make_source_combo(self._sources, ('flat',),
+                                          stored.get('flat')),
+            }
+            for col, kind in enumerate(('bias', 'dark', 'darkflat', 'flat'),
+                                       start=2):
+                self._assign_table.setCellWidget(row, col, combos[kind])
+            self._night_rows.append((night, combos))
+
+        self._fill_suggestions()
+
+    def _fill_suggestions(self, force: bool = False):
+        """
+        Pre-select the most plausible source per night.
+
+        Concrete sources are chosen rather than "Auto" so the wizard shows what
+        will actually be used — the checking page then flags anything doubtful.
+        """
+        for night, combos in self._night_rows:
+            for kind, cb in combos.items():
+                if not force and cb.currentData() != SID_AUTO:
+                    continue
+                sid = self._suggest(kind, night)
+                idx = cb.findData(sid) if sid else -1
+                cb.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _suggest(self, kind: str, night: str) -> Optional[str]:
+        """Best source ID for one night and calibration kind, or None."""
+        lights = [fi for fi in self._infos
+                  if not fi['is_master'] and fi['imgtype'] == 'light'
+                  and fi['session'] == night]
+        if kind == 'bias':
+            pooled = subs_sid('bias', ANY_SESSION)
+            if any(s.sid == pooled for s in self._sources):
+                return pooled
+            return next((s.sid for s in self._sources if s.kind == 'bias'), None)
+
+        if kind == 'dark':
+            want = [fi['exptime'] for fi in lights if fi.get('exptime') is not None]
+            target = max(set(want), key=want.count) if want else None
+            best, best_delta = None, float('inf')
+            for s in self._sources:
+                if s.kind != 'dark':
+                    continue
+                if target is None or s.exptime is None:
+                    if best is None:
+                        best = s.sid
+                    continue
+                delta = abs(s.exptime - target)
+                # pooled sources win ties: a dark library covers every night
+                if delta < best_delta or (delta == best_delta
+                                          and s.session == ANY_SESSION):
+                    best, best_delta = s.sid, delta
+            return best
+
+        if kind == 'flat':
+            best, best_delta = None, None
+            for s in self._sources:
+                if s.kind != 'flat':
+                    continue
+                delta = session_delta_days(night, s.session)
+                score = abs(delta) if delta is not None else 10 ** 6
+                if best_delta is None or score < best_delta:
+                    best, best_delta = s.sid, score
+            return best
+
+        if kind == 'darkflat':
+            # What calibrates the flats: a real dark flat, or a dark of the
+            # same exposure, or - when neither is close enough - the bias.
+            # A 300 s dark is not a dark flat for 3 s flats.
+            flats = [fi for fi in self._infos
+                     if not fi['is_master'] and fi['imgtype'] == 'flat']
+            want = [fi['exptime'] for fi in flats if fi.get('exptime') is not None]
+            target = max(set(want), key=want.count) if want else None
+            bias = next((s.sid for s in self._sources if s.kind == 'bias'), None)
+
+            candidates = [s for s in self._sources if s.kind == 'darkflat'] \
+                or [s for s in self._sources if s.kind == 'dark']
+            best, best_delta = None, float('inf')
+            for s in candidates:
+                if target is None or s.exptime is None:
+                    if best is None:
+                        best = s.sid
+                    continue
+                delta = abs(s.exptime - target)
+                if delta < best_delta:
+                    best, best_delta = s.sid, delta
+
+            if best is not None and best_delta > self.DEFAULT_EXP_TOL_S and bias:
+                return bias
+            return best or bias
+        return None
+
+    def _apply_to_all_nights(self, kind: str):
+        """Copy the selected row's choice for one kind to every night."""
+        if not self._night_rows:
+            return
+        row = max(self._assign_table.currentRow(), 0)
+        source_combo = self._night_rows[row][1][kind]
+        sid = source_combo.currentData()
+        for _, combos in self._night_rows:
+            idx = combos[kind].findData(sid)
+            if idx >= 0:
+                combos[kind].setCurrentIndex(idx)
+
+    # ── Page 4: plausibility check ───────────────────────────────────────────
+
+    def _build_page_check(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        tol = QHBoxLayout(); tol.setSpacing(8)
+        tol.addWidget(QLabel('Toleranz Belichtungszeit:'))
+        self._spin_exp_tol = QDoubleSpinBox()
+        self._spin_exp_tol.setRange(0.0, 600.0)
+        self._spin_exp_tol.setDecimals(1)
+        self._spin_exp_tol.setSingleStep(1.0)
+        self._spin_exp_tol.setValue(self.DEFAULT_EXP_TOL_S)
+        self._spin_exp_tol.setSuffix(' s')
+        self._spin_exp_tol.setFixedWidth(90)
+        self._spin_exp_tol.setToolTip(
+            'Erlaubter Unterschied zwischen der Belichtungszeit der Lights und\n'
+            'der des zugeordneten Darks (bzw. Flats und Dark-Flats).')
+        self._spin_exp_tol.valueChanged.connect(self._refresh_check_page)
+        tol.addWidget(self._spin_exp_tol)
+
+        tol.addSpacing(16)
+        tol.addWidget(QLabel('Toleranz Flat-Datum:'))
+        self._spin_date_tol = QSpinBox()
+        self._spin_date_tol.setRange(0, 365)
+        self._spin_date_tol.setValue(self.DEFAULT_DATE_TOL_D)
+        self._spin_date_tol.setSuffix(' Tage')
+        self._spin_date_tol.setFixedWidth(90)
+        self._spin_date_tol.setToolTip(
+            'Wie weit das Flat von der Nacht der Lights entfernt sein darf.\n'
+            'Ein Flat vom 15.08. gehört nicht zur Nacht vom 13. auf den 14.,\n'
+            'ein Flat vom Nachmittag des 14. dagegen schon.')
+        self._spin_date_tol.valueChanged.connect(self._refresh_check_page)
+        tol.addWidget(self._spin_date_tol)
+        tol.addStretch()
+        lay.addLayout(tol)
+
+        self._check_table = QTableWidget(0, 3)
+        self._check_table.setHorizontalHeaderLabels(['', 'Nacht', 'Meldung'])
+        self._prepare_table(self._check_table, stretch_from=2)
+        lay.addWidget(self._check_table, stretch=1)
+
+        self._chk_accept = QCheckBox(
+            'Warnungen geprüft – Zuordnung trotzdem übernehmen')
+        self._chk_accept.setVisible(False)
+        self._chk_accept.toggled.connect(self._update_nav)
+        lay.addWidget(self._chk_accept)
+
+        self._check_status = QLabel()
+        self._check_status.setStyleSheet('color:#888899; font-size:9pt;')
+        lay.addWidget(self._check_status)
+        return page
+
+    def _validate(self) -> list[tuple[str, str, str]]:
+        """
+        Check every night's assignment.  Returns (severity, night, message)
+        with severity in {'error', 'warn', 'info'}.
+        """
+        out: list[tuple[str, str, str]] = []
+        exp_tol  = self._spin_exp_tol.value()
+        date_tol = self._spin_date_tol.value()
+        by_sid   = {s.sid: s for s in self._sources}
+
+        flats_by_night: dict = defaultdict(list)
+        for fi in self._infos:
+            if not fi['is_master'] and fi['imgtype'] == 'flat':
+                flats_by_night[fi['session']].append(fi)
+
+        for night, combos in self._night_rows:
+            lights = [fi for fi in self._infos
+                      if not fi['is_master'] and fi['imgtype'] == 'light'
+                      and fi['session'] == night]
+            exps = [fi['exptime'] for fi in lights if fi.get('exptime') is not None]
+
+            for kind, label in (('bias', 'Bias'), ('dark', 'Dark'),
+                                ('darkflat', 'Dark-Flat'), ('flat', 'Flat')):
+                sid = combos[kind].currentData()
+                if sid == SID_NONE:
+                    out.append(('info', night,
+                                f'{label}: bewusst keine Zuordnung.'))
+                    continue
+                if sid == SID_AUTO:
+                    out.append(('warn', night,
+                                f'{label}: steht auf „Auto" – die Zuordnung '
+                                f'wird wieder aus dem Aufnahmedatum abgeleitet.'))
+                    continue
+                if sid == SID_SYNTHETIC:
+                    if not self._synthetic_bias:
+                        out.append(('error', night,
+                                    f'{label}: synthetischer Bias gewählt, aber '
+                                    f'im Hauptfenster ist kein Ausdruck gesetzt.'))
+                    continue
+                src = by_sid.get(sid)
+                if src is None:
+                    out.append(('error', night,
+                                f'{label}: Quelle nicht verfügbar ({sid}).'))
+                    continue
+
+                # ── Belichtungszeit: Dark gegen Lights ────────────────────
+                if kind == 'dark' and exps and src.exptime is not None:
+                    target = max(set(exps), key=exps.count)
+                    delta = abs(src.exptime - target)
+                    if delta > exp_tol:
+                        out.append((
+                            'warn', night,
+                            f'Dark: Belichtungszeit {src.exptime:.1f} s weicht '
+                            f'um {delta:.1f} s von den Lights ({target:.1f} s) '
+                            f'ab – erlaubt sind ±{exp_tol:.0f} s.'))
+
+                # ── Belichtungszeit: Dark-Flat gegen Flats ────────────────
+                if kind == 'darkflat' and src.exptime is not None:
+                    f_exps = [fi['exptime'] for fi in flats_by_night.get(night, [])
+                              if fi.get('exptime') is not None]
+                    if not f_exps:
+                        # flats may come from another night – use the assigned one
+                        flat_src = by_sid.get(combos['flat'].currentData())
+                        if flat_src is not None:
+                            f_exps = [fi['exptime'] for fi in flat_src.files
+                                      if fi.get('exptime') is not None]
+                    if f_exps:
+                        target = max(set(f_exps), key=f_exps.count)
+                        delta = abs(src.exptime - target)
+                        if delta > exp_tol:
+                            out.append((
+                                'warn', night,
+                                f'Dark-Flat: Belichtungszeit {src.exptime:.1f} s '
+                                f'weicht um {delta:.1f} s von den Flats '
+                                f'({target:.1f} s) ab – erlaubt sind '
+                                f'±{exp_tol:.0f} s.'))
+
+                # ── Datum: Flat gegen die Nacht der Lights ────────────────
+                if kind == 'flat' and src.session:
+                    delta = session_delta_days(night, src.session)
+                    if delta is None:
+                        out.append(('warn', night,
+                                    'Flat: Aufnahmedatum unbekannt – die '
+                                    'Zuordnung lässt sich nicht prüfen.'))
+                    elif abs(delta) > date_tol:
+                        direction = 'nach' if delta > 0 else 'vor'
+                        out.append((
+                            'warn', night,
+                            f'Flat vom {src.session} liegt {abs(delta)} Tage '
+                            f'{direction} der Nacht {night} – erlaubt sind '
+                            f'{date_tol} Tag(e). Ein Flat von einem anderen Tag '
+                            f'passt nur, wenn der optische Aufbau unverändert war.'))
+
+            if not lights:
+                out.append(('info', night, 'Keine Lights in dieser Nacht.'))
+
+        order = {'error': 0, 'warn': 1, 'info': 2}
+        out.sort(key=lambda x: (order[x[0]], x[1]))
+        return out
+
+    def _refresh_check_page(self):
+        issues = self._validate()
+        self._check_table.setRowCount(len(issues))
+        icons = {'error': ('⛔', '#FF7070'), 'warn': ('⚠', '#FFB347'),
+                 'info': ('ℹ', '#8899AA')}
+        for row, (sev, night, msg) in enumerate(issues):
+            icon, color = icons[sev]
+            cell = self._ro_cell(icon)
+            cell.setForeground(QColor(color))
+            self._check_table.setItem(row, 0, cell)
+            self._check_table.setItem(row, 1, self._ro_cell(night))
+            text = self._ro_cell(msg)
+            text.setForeground(QColor(color))
+            self._check_table.setItem(row, 2, text)
+
+        n_err  = sum(1 for s, _, _ in issues if s == 'error')
+        n_warn = sum(1 for s, _, _ in issues if s == 'warn')
+        self._needs_confirm = (n_warn + n_err) > 0
+        self._chk_accept.setVisible(self._needs_confirm)
+        if n_err:
+            self._check_status.setText(
+                f'{n_err} Fehler, {n_warn} Warnung(en). '
+                f'Fehler bitte auf Seite 3 beheben.')
+        elif n_warn:
+            self._check_status.setText(
+                f'{n_warn} Warnung(en). Übernehmen ist möglich, sobald sie '
+                f'bestätigt sind.')
+        else:
+            self._check_status.setText('Keine Auffälligkeiten – alles plausibel.')
+        self._update_nav()
+
+    # ── Loading files ────────────────────────────────────────────────────────
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Ordner mit FITS-Dateien wählen', str(Path.home()))
+        if folder:
+            self._add_paths([folder])
+
+    def _add_paths(self, raw_paths: list[str]):
+        if self._scan_thread and self._scan_thread.isRunning():
+            return
+        files = collect_fits(raw_paths)
+        known = {fi['path'].resolve() for fi in self._infos}
+        new = [f for f in files if f.resolve() not in known]
+        if not new:
+            self._hint_lbl.setText(
+                'Keine neuen FITS-Dateien gefunden – alles bereits geladen.')
+            return
+
+        self._progress.setMaximum(len(new))
+        self._progress.setValue(0)
+        self._progress.setFormat('%v / %m  (Header werden gelesen)')
+        self._progress.setVisible(True)
+        self._set_nav_enabled(False)
+
+        self._scan_thread = ScanThread(new)
+        self._scan_thread.progress.connect(
+            lambda done, total: self._progress.setValue(done))
+        self._scan_thread.result.connect(self._on_scanned)
+        self._scan_thread.start()
+
+    def _on_scanned(self, infos: list[dict]):
+        self._progress.setVisible(False)
+        self._infos.extend(infos)
+        if self._chk_darkflat_names.isChecked():
+            self._retyped = apply_darkflat_name_hints(self._infos)
+        self._refresh_lights_page()
+        self._refresh_calibration_page()
+        self._set_nav_enabled(True)
+        self._update_nav()
+
+    # ── Navigation ───────────────────────────────────────────────────────────
+
+    def _goto(self, index: int):
+        index = max(0, min(index, self._stack.count() - 1))
+        if index == 1:
+            self._refresh_calibration_page()
+        elif index == 2:
+            self._refresh_assign_page()
+        elif index == 3:
+            # The check reads the assignment rows, so make sure they exist even
+            # when this page is reached without stopping at the previous one.
+            if not self._night_rows:
+                self._refresh_assign_page()
+            self._refresh_check_page()
+        self._stack.setCurrentIndex(index)
+        self._step_lbl.setText(
+            f'Schritt {index + 1} von {len(self.PAGES)}   ·   {self.PAGES[index]}')
+        self._hint_lbl.setText([
+            'Lights hier ablegen – einzelne Dateien, ein Ordner, oder gleich der '
+            'Ordner mit allen Daten. Der Assistent liest die Header und zeigt, '
+            'welche Nächte er gefunden hat.',
+            'Alles, was noch fehlt: Bias, Darks, Flats, Dark-Flats. Wurde oben '
+            'bereits ein Ordner mit allem geladen, steht hier schon alles.',
+            'Pro Nacht festlegen, was verwendet wird. Der Vorschlag ist '
+            'vorausgefüllt und lässt sich überall ändern – geprüft wird im '
+            'nächsten Schritt.',
+            'Belichtungszeiten und Aufnahmedaten werden gegen die Zuordnung '
+            'geprüft. Warnungen lassen sich bestätigen, wenn der Aufbau es '
+            'hergibt.',
+        ][index])
+        self._update_nav()
+
+    def _set_nav_enabled(self, on: bool):
+        for b in (self._btn_back, self._btn_next, self._btn_finish):
+            b.setEnabled(on)
+
+    def _update_nav(self):
+        index = self._stack.currentIndex()
+        has_lights = any(not fi['is_master'] and fi['imgtype'] == 'light'
+                         for fi in self._infos)
+        self._btn_back.setEnabled(index > 0)
+        self._btn_next.setEnabled(index < self._stack.count() - 1
+                                  and (has_lights or index > 0))
+        self._btn_next.setVisible(index < self._stack.count() - 1)
+
+        can_finish = index == self._stack.count() - 1 and has_lights
+        if can_finish and self._needs_confirm:
+            can_finish = self._chk_accept.isChecked()
+        self._btn_finish.setEnabled(can_finish)
+        self._btn_finish.setVisible(index == self._stack.count() - 1)
+
+    def _finish(self):
+        self.accept()
+
+    # ── Widget helpers ───────────────────────────────────────────────────────
+
+    def _prepare_table(self, table: QTableWidget, stretch_from: Optional[int] = None):
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(self._TABLE_QSS)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.verticalHeader().setDefaultSectionSize(30)
+        hdr = table.horizontalHeader()
+        cols = table.columnCount()
+        cut = stretch_from if stretch_from is not None else cols - 1
+        for col in range(cols):
+            hdr.setSectionResizeMode(
+                col,
+                QHeaderView.ResizeMode.Stretch if col >= cut
+                else QHeaderView.ResizeMode.ResizeToContents)
+
+    @staticmethod
+    def _ro_cell(text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        return item
+
+    # ── Result ───────────────────────────────────────────────────────────────
+
+    @property
+    def infos(self) -> list[dict]:
+        """Everything the wizard loaded, dark-flat hints already applied."""
+        return self._infos
+
+    @property
+    def assignments(self) -> dict:
+        """
+        Per-night choices expanded to the engine's group-level tables.
+
+        A night's bias/dark/flat applies to every light group of that night;
+        its dark-flat becomes the bias of every flat group the assigned flat
+        source belongs to.
+        """
+        lights_tbl: dict = {}
+        flats_tbl:  dict = {}
+        by_sid = {s.sid: s for s in self._sources}
+
+        for night, combos in self._night_rows:
+            picked = {kind: cb.currentData() for kind, cb in combos.items()}
+            groups = {
+                (fi.get('object_name') or 'unknown', fi['filter'],
+                 _exptime_key(fi.get('exptime')))
+                for fi in self._infos
+                if not fi['is_master'] and fi['imgtype'] == 'light'
+                and fi['session'] == night
+            }
+            entry = {k: picked[k] for k in ('bias', 'dark', 'flat')
+                     if picked.get(k) and picked[k] != SID_AUTO}
+            if entry:
+                for obj, filt, exp_key in groups:
+                    lights_tbl[light_group_key(obj, night, filt, exp_key)] = dict(entry)
+
+            # The dark flat calibrates the flats themselves, so it is stored
+            # against the flat group the chosen flat source stands for.
+            df = picked.get('darkflat')
+            flat_src = by_sid.get(picked.get('flat'))
+            if df and df != SID_AUTO and flat_src is not None and flat_src.files:
+                for fi in flat_src.files:
+                    flats_tbl[flat_group_key(fi['session'], fi['filter'])] = {'bias': df}
+
+        return {'lights': lights_tbl, 'flats': flats_tbl}
 
 
 class FITSOrganizerWindow(QMainWindow):
@@ -2899,6 +3789,27 @@ class FITSOrganizerWindow(QMainWindow):
         bottom.addWidget(self.assign_btn)
         bottom.addSpacing(8)
 
+        # The wizard is deliberately optional: everything it does can also be
+        # done with the drop zone plus the assignment dialog.
+        self.wizard_btn = QPushButton('🧙  Assistent')
+        self.wizard_btn.setFixedHeight(40)
+        self.wizard_btn.setToolTip(
+            'Schritt für Schritt: Lights laden, Kalibrierungsdaten laden,\n'
+            'pro Nacht zuordnen, Belichtungszeiten und Daten prüfen.\n'
+            'Funktioniert auch bei komplett leerem Fenster.')
+        self.wizard_btn.setStyleSheet("""
+            QPushButton {
+                background-color:#2a1a40; color:#e0cfff;
+                font-size:10pt; border-radius:8px; border:1px solid #6a44aa;
+                padding: 0 12px;
+            }
+            QPushButton:hover   { background-color:#3a2458; }
+            QPushButton:pressed { background-color:#1d1230; }
+        """)
+        self.wizard_btn.clicked.connect(self._run_wizard)
+        bottom.addWidget(self.wizard_btn)
+        bottom.addSpacing(8)
+
         self.go_btn = QPushButton('▶   Go – Start Pre-processing')
         self.go_btn.setFixedHeight(40)
         self.go_btn.setMinimumWidth(260)
@@ -2997,6 +3908,34 @@ class FITSOrganizerWindow(QMainWindow):
             'Calibration assignment cleared – all groups matched automatically.',
             LogColor.GREEN)
         self._update_assign_button()
+
+    def _run_wizard(self):
+        """Open the optional step-by-step wizard and adopt its result."""
+        if self._proc_worker and self._proc_worker.isRunning():
+            return
+        dlg = CalibrationWizard(self, self._all_infos, self._external_darks,
+                                self.bias_input.text())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._all_infos = dlg.infos
+        self._assignments = dlg.assignments
+        self._build_tree(self._all_infos)
+        self._save_config()
+
+        n_masters = sum(1 for fi in self._all_infos if fi['is_master'])
+        n_subs    = len(self._all_infos) - n_masters
+        self.status_label.setText(
+            f'{len(self._all_infos)} file(s)  –  {n_subs} sub(s)'
+            f'  |  {n_masters} master(s)')
+        self.go_btn.setEnabled(n_subs > 0)
+        self.assign_btn.setEnabled(bool(self._all_infos))
+        self._update_assign_button()
+        n = (len(self._assignments.get('lights', {}))
+             + len(self._assignments.get('flats', {})))
+        self.siril.log(
+            f'Assistent abgeschlossen: {len(self._all_infos)} Datei(en), '
+            f'{n} Gruppe(n) zugeordnet.', LogColor.GREEN)
 
     def _update_assign_button(self):
         """Show the number of manual assignments on the button itself."""

@@ -63,6 +63,49 @@ abgeleitet wird:
 Weil die IDs stabil sind, überlebt eine einmal korrigierte Zuordnung Neustarts:
 sie wird in der Konfigurationsdatei gespeichert.
 
+## Der Assistent (optional)
+
+Wer nicht mit der Tabelle arbeiten will, klickt auf **🧙 Assistent** und wird in
+vier Schritten durchgeführt. Der Assistent ist rein optional – alles, was er
+macht, geht auch über Drop-Zone plus Zuordnungs-Dialog.
+
+**Schritt 1 – Lights.** Lights reinziehen oder einen Ordner wählen. Es darf auch
+gleich der Ordner mit *allen* Daten sein: der Assistent liest die Header, zeigt
+die gefundenen Nächte und legt den Rest schon für Schritt 2 beiseite.
+
+**Schritt 2 – Kalibrierung.** Was noch fehlt: Bias, Darks, Flats, Dark-Flats.
+Hier greift zusätzlich die **Dateinamen-Erkennung für Dark-Flats** – viele
+Programme schreiben für Dark-Flats `IMAGETYP=Dark` oder gar nichts Brauchbares.
+Erkannt werden im Dateinamen:
+
+```
+darkflat   dark_flat   dark-flat   dark.flat   "dark flat"
+flatdark   flat_dark   flat-dark   flat.dark   "flat dark"
+```
+
+Umgestufte Dateien werden namentlich aufgelistet, und die Regel lässt sich
+abschalten – dann gilt wieder der Header. Nur der *Dateiname* zählt, nicht der
+Ordnername: ein Ordner `dark_flats` macht aus normalen Darks keine Dark-Flats.
+
+**Schritt 3 – Zuordnung pro Nacht.** Eine Zeile je Nacht, mit Auswahl für Bias,
+Dark, Dark-Flat und Flat. Vorausgefüllt ist immer ein **konkreter** Vorschlag
+(nie „Auto"), damit sichtbar ist, was tatsächlich verwendet wird. Pro Art gibt
+es einen Knopf **„… auf alle Nächte"** – genau der Fall Dark-Bibliothek, die für
+jede Nacht gelten soll.
+
+**Schritt 4 – Prüfung.** Vor dem Übernehmen wird gegengeprüft:
+
+| Prüfung | Standard | Meldung |
+|---|---|---|
+| Belichtungszeit Dark ↔ Lights | ±5 s | „Dark: Belichtungszeit 240,0 s weicht um 60,0 s von den Lights ab" |
+| Belichtungszeit Dark-Flat ↔ Flats | ±5 s | dito, bezogen auf die Flats |
+| Datum Flat ↔ Nacht der Lights | ±1 Tag | „Flat vom 2026-08-15 liegt 2 Tage nach der Nacht 2026-08-13" |
+| Zeile steht noch auf „Auto" | – | Hinweis, dass wieder das Aufnahmedatum entscheidet |
+
+Beide Toleranzen sind im Dialog einstellbar. Warnungen blockieren nicht, müssen
+aber ausdrücklich bestätigt werden – ein Flat von einem anderen Tag kann passen,
+wenn der optische Aufbau unverändert war, nur soll das niemand aus Versehen tun.
+
 ### Weitere Ergänzungen
 
 * **Strict-Modus** (in den Pipeline-Optionen): Kalibrierungs-Frames werden
@@ -99,6 +142,8 @@ und das Original stören sich also nicht gegenseitig.
 
 ## Benutzung
 
+Entweder geführt über **🧙 Assistent** (siehe oben) – oder von Hand:
+
 1. FITS-Dateien oder Ordner in das Fenster ziehen.
 2. Baumansicht prüfen; falsch erkannte Dateien per Rechtsklick korrigieren.
 3. **🎯 Calibration Assignment** öffnen und die Zuordnungen setzen, die die
@@ -116,14 +161,15 @@ Ohne Siril lauffähig – `sirilpy` wird gestubbt, Qt läuft offscreen:
 
 ```bash
 pip install astropy numpy PyQt6
-python3 tests/test_assignment.py
+python3 tests/run_all.py
 ```
 
-38 Tests decken Quellen-Enumeration, Zuordnungs-Auflösung, Strict-Modus,
-Fallback bei fehlenden Dateien, Konfigurations-Round-Trip und den Dialog ab.
-Ein Test hält ausdrücklich fest, dass die **automatische** Zuordnung das Flat
-aus einer anderen Nacht nicht findet – das ist der Ausgangsbefund, den dieser
-Fork behebt.
+86 Tests: Quellen-Enumeration, Zuordnungs-Auflösung, Strict-Modus, Fallback bei
+fehlenden Dateien, Konfigurations-Round-Trip, beide Dialoge, alle vier
+Assistenten-Schritte, die Dateinamen-Regel für Dark-Flats und die beiden
+Plausibilitätsprüfungen. Ein Test hält ausdrücklich fest, dass die
+**automatische** Zuordnung das Flat aus einer anderen Nacht nicht findet – der
+Ausgangsbefund, den dieser Fork behebt.
 
 ## Lizenz
 
@@ -150,3 +196,11 @@ Assignments persist in the config file. A **strict mode** disables date-based
 matching entirely: anything left on "Auto" is simply not applied.
 
 Every row defaults to "Auto", which is the unchanged upstream behaviour.
+
+An optional four-step **wizard** covers the same ground for people who prefer
+to be guided: load the lights (or one folder holding everything), load the
+remaining calibration frames, assign per night with an "apply to all nights"
+button per kind, and finally check exposure times (±5 s by default) and flat
+dates (±1 day) before anything is applied. Dark flats are additionally
+recognised from the file name (darkflat / dark_flat / dark-flat / flat_dark
+and so on).

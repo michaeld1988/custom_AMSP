@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.2.0 – Assistent
+
+### Neu: optionaler Kalibrierungs-Assistent
+
+Knopf **🧙 Assistent** im Hauptfenster, vier Schritte. Rein optional – alles,
+was er macht, geht auch weiterhin über Drop-Zone und Zuordnungs-Dialog.
+
+* **Schritt 1 – Lights**: per Drop oder Ordnerauswahl. Es darf gleich der
+  Ordner mit allen Daten sein; erkannte Nächte werden mit Objekt, Filter,
+  Belichtungszeit und Frame-Zahl aufgelistet.
+* **Schritt 2 – Kalibrierung**: alles, was noch fehlt. Zusätzlich werden
+  **Dark-Flats am Dateinamen erkannt** – `darkflat`, `dark_flat`, `dark-flat`,
+  `dark.flat`, `dark flat` und dieselben vier mit vertauschten Wörtern.
+  Umgestufte Dateien werden aufgelistet, die Regel ist abschaltbar und
+  umkehrbar. Nur der Dateiname zählt, nicht der Ordnername.
+* **Schritt 3 – Zuordnung pro Nacht**: eine Zeile je Nacht mit Bias, Dark,
+  Dark-Flat und Flat. Vorausgefüllt wird immer eine konkrete Quelle statt
+  „Auto", damit sichtbar ist, was verwendet wird. Pro Art ein Knopf
+  **„… auf alle Nächte"** – der Fall Dark-Bibliothek.
+* **Schritt 4 – Prüfung**:
+  * Belichtungszeit Dark ↔ Lights, Standardtoleranz **±5 s**
+  * Belichtungszeit Dark-Flat ↔ Flats, dieselbe Toleranz
+  * Datum Flat ↔ Nacht der Lights, Standardtoleranz **±1 Tag** – ein Flat vom
+    15.08. gehört nicht zur Nacht vom 13. auf den 14., ein Flat vom Nachmittag
+    des 14. dagegen schon
+  * Zeilen, die noch auf „Auto" stehen, werden gemeldet
+  * beide Toleranzen einstellbar; Warnungen müssen bestätigt werden, bevor
+    „Übernehmen" freigeschaltet wird
+* Das Ergebnis fließt in dieselben Zuordnungstabellen wie der Dialog – der
+  Assistent ist eine Oberfläche, kein zweiter Codepfad.
+
+### Weitere Änderungen
+
+* Die Vorauswahl für Dark-Flats nimmt den Bias, wenn kein Dark innerhalb der
+  Toleranz zur Belichtungszeit der Flats passt. Ein 300-s-Dark ist kein
+  Dark-Flat für 3-s-Flats.
+* `DropZone` lässt sich beschriften und wird von den Assistenten-Seiten
+  wiederverwendet.
+* Auswahllisten für Kalibrierungsquellen kommen aus einer gemeinsamen
+  Funktion, damit Dialog und Assistent identische Quellen-IDs erzeugen.
+* Testsuite auf 86 Tests erweitert; `python3 tests/run_all.py` führt alles aus.
+
 ## 1.1.0 – Custom AMSP (Fork von AMSP 1.0.17)
 
 ### Neu: manuelle Zuordnung der Kalibrierungs-Frames
