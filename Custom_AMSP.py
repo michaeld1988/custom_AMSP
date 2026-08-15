@@ -52,9 +52,22 @@ Pipeline:
              calibrate all sessions → register → stack → clean up before next group
   Phase 5 – Cross-stack Alignment: align stacks of the same object across filters
 
-  version 1.2.0  (fork of upstream AMSP 1.0.17)
+  version 1.3.0  (fork of upstream AMSP 1.0.17)
 
   Custom AMSP changes
+  1.3.0  Capture series: a night runs noon to noon, which is too coarse for
+         calibration frames — flats shot at 18:54 and flats shot at 06:12 the
+         next morning are the same night by that rule, yet two separate sets.
+         - frames are additionally grouped into series, split wherever the
+           capture gap exceeds a configurable threshold (default 2 h)
+         - series are selectable sources of their own (batch:... IDs), so each
+           night can be given its own set of flats
+         - the file tree shows a series level wherever a group really splits
+         - the wizard suggests the series nearest in time, shows that distance
+           per night, and checks it interval to interval instead of comparing
+           calendar days (tolerance now in hours, default 24 h)
+         - flat assignments are keyed by source ID, so two series of one night
+           no longer overwrite each other
   1.2.0  Optional calibration wizard (button "Assistent"):
          - step 1 loads the lights by drop or folder and reports the nights
          - step 2 takes the remaining calibration frames; dark flats are also
@@ -166,7 +179,7 @@ from astropy.io import fits as astrofits
 # =============================================================================
 
 APP_NAME         = "Custom AMSP – Multi-Session Processing"
-VERSION          = "1.2.0"
+VERSION          = "1.3.0"
 FITS_SUFFIXES    = {'.fits', '.fit', '.fts'}
 FITS_FZ_SUFFIXES = {'.fits.fz', '.fit.fz', '.fts.fz'}
 FITS_EXTS      = tuple(FITS_SUFFIXES | FITS_FZ_SUFFIXES)
@@ -229,6 +242,16 @@ SID_SYNTHETIC = '__synthetic__'  # use the synthetic bias expression
 # Pooled-across-all-nights marker used inside source IDs, e.g.
 # 'subs:dark:*:300s' = every 300 s dark sub, whatever night it was shot on.
 ANY_SESSION = '*'
+
+# ── Capture series ───────────────────────────────────────────────────────────
+# A "night" runs noon to noon, which is the right unit for lights but too
+# coarse for calibration frames: flats shot at 18:54 and flats shot at 06:12
+# the next morning land in the same night and would be stacked into one
+# master.  Frames are therefore additionally grouped into series - runs of
+# frames taken back to back, split wherever the gap exceeds this many hours.
+DEFAULT_BATCH_GAP_H = 2.0
+# Guard against pathological data producing an unusable drop-down.
+MAX_BATCHES_PER_GROUP = 24
 
 # =============================================================================
 # Utility functions
@@ -369,6 +392,96 @@ def apply_darkflat_name_hints(infos: list[dict]) -> list[dict]:
             fi['imgtype'] = 'darkflat'
             changed.append(fi)
     return changed
+
+
+def parse_obs(date_obs: str) -> Optional[datetime]:
+    """DATE-OBS as a datetime, or None when it is missing or unparseable."""
+    try:
+        return datetime.fromisoformat(str(date_obs).replace('Z', ''))
+    except (ValueError, TypeError):
+        return None
+
+
+def cluster_by_time(infos: list[dict],
+                    gap_hours: float = DEFAULT_BATCH_GAP_H) -> list[list[dict]]:
+    """
+    Split frames into capture series: consecutive runs whose gap stays below
+    gap_hours.  Frames without a usable DATE-OBS end up in one trailing series
+    rather than being dropped.
+
+    Returns at least one series whenever infos is non-empty.
+    """
+    dated:   list[tuple[datetime, dict]] = []
+    undated: list[dict] = []
+    for fi in infos:
+        t = parse_obs(fi.get('date_obs', ''))
+        if t is None:
+            undated.append(fi)
+        else:
+            dated.append((t, fi))
+    dated.sort(key=lambda x: x[0])
+
+    out: list[list[dict]] = []
+    current: list[dict] = []
+    previous: Optional[datetime] = None
+    for t, fi in dated:
+        if (previous is not None
+                and (t - previous).total_seconds() > gap_hours * 3600):
+            out.append(current)
+            current = []
+        current.append(fi)
+        previous = t
+    if current:
+        out.append(current)
+    if undated:
+        out.append(undated)
+    return out
+
+
+def batch_range(files: list[dict]) -> tuple[Optional[datetime], Optional[datetime]]:
+    """First and last capture time of a series (None, None when undated)."""
+    times = [t for t in (parse_obs(fi.get('date_obs', '')) for fi in files)
+             if t is not None]
+    return (min(times), max(times)) if times else (None, None)
+
+
+def interval_gap_hours(a_start: Optional[datetime], a_end: Optional[datetime],
+                       b_start: Optional[datetime], b_end: Optional[datetime]
+                       ) -> Optional[float]:
+    """
+    Hours between two time intervals; 0.0 when they overlap, None when either
+    side has no usable timestamps.
+
+    This is what "does this flat belong to that night?" really asks — far more
+    precise than comparing noon-to-noon night keys, which cannot separate two
+    series inside the same night at all.
+    """
+    if None in (a_start, a_end, b_start, b_end):
+        return None
+    if b_start > a_end:
+        return (b_start - a_end).total_seconds() / 3600.0
+    if a_start > b_end:
+        return (a_start - b_end).total_seconds() / 3600.0
+    return 0.0
+
+
+def format_hours(hours: float) -> str:
+    """Human-readable duration: '2,0 h' below two days, '3,2 Tage' above."""
+    if hours < 48.0:
+        return f'{hours:.1f} h'.replace('.', ',')
+    return f'{hours / 24.0:.1f} Tage'.replace('.', ',')
+
+
+def format_span(t_start: Optional[datetime],
+                t_end: Optional[datetime]) -> str:
+    """Label for a capture series: '2026-08-14 18:54 – 18:59'."""
+    if t_start is None:
+        return 'ohne DATE-OBS'
+    if t_end is None or t_end == t_start:
+        return t_start.strftime('%Y-%m-%d %H:%M')
+    if t_end.date() == t_start.date():
+        return f'{t_start:%Y-%m-%d %H:%M} – {t_end:%H:%M}'
+    return f'{t_start:%Y-%m-%d %H:%M} – {t_end:%Y-%m-%d %H:%M}'
 
 
 def session_delta_days(a: str, b: str) -> Optional[int]:
@@ -557,16 +670,39 @@ class CalSource:
     exptime: Optional[float] = None
     files:   list           = field(default_factory=list)  # raw subs to stack
     path:    Optional[Path] = None                          # ready-made master
+    batch:   str            = ''             # series key, '' for whole groups
+    t_start: Optional[datetime] = None
+    t_end:   Optional[datetime] = None
 
     @property
     def is_file(self) -> bool:
         """True when the source is an existing file (no stacking required)."""
         return self.path is not None
 
+    @property
+    def is_batch(self) -> bool:
+        """True for one capture series rather than a whole night or pool."""
+        return bool(self.batch)
+
 
 def subs_sid(kind: str, session: str, qualifier: str = '') -> str:
     """Source ID of a group of raw sub frames."""
     return f'subs:{kind}:{session}:{qualifier}'
+
+
+def batch_sid(kind: str, batch_key: str, qualifier: str = '') -> str:
+    """
+    Source ID of a single capture series.
+
+    The key is the series start (YYYY-MM-DDTHH:MM), which stays stable as long
+    as the frames do — re-running the same project keeps the assignment.
+    """
+    return f'batch:{kind}:{batch_key}:{qualifier}'
+
+
+def batch_key_of(files: list[dict]) -> str:
+    t_start, _ = batch_range(files)
+    return t_start.strftime('%Y-%m-%dT%H:%M') if t_start else 'undated'
 
 
 def file_sid(path: Path) -> str:
@@ -588,20 +724,59 @@ def _filt_label(filt: str) -> str:
     return 'no filter' if filt == NO_FILTER else filt
 
 
+def _common_exptime(files: list[dict]) -> Optional[float]:
+    """Most frequent exposure time in a group, ignoring frames without one."""
+    exps = [fi['exptime'] for fi in files if fi.get('exptime') is not None]
+    return float(max(set(exps), key=exps.count)) if exps else None
+
+
 def enumerate_cal_sources(all_infos: list[dict],
-                          external_darks: Optional[Path] = None
+                          external_darks: Optional[Path] = None,
+                          batch_gap_hours: float = DEFAULT_BATCH_GAP_H
                           ) -> list[CalSource]:
     """
     Build the full list of assignable calibration sources from the loaded
     files (plus the external darks folder, if configured).
 
-    Order: bias, dark, dark-flat, flat; pooled entries before per-night ones,
+    Three levels of granularity, coarse to fine:
+      * pooled across all nights   (dark libraries)
+      * one night                  (the noon-to-noon session)
+      * one capture series         (a run of frames, split at `batch_gap_hours`)
+
+    The series level exists because a night is too coarse for calibration
+    frames: flats shot at 18:54 and flats shot at 06:12 the next morning are
+    the same night by the noon-to-noon rule, yet they are two separate sets.
+    Series entries are only added where a group really does split, so simple
+    projects see exactly the same list as before.
+
+    Order: bias, dark, dark-flat, flat; pooled before per-night before series;
     raw sub groups before ready-made files.
     """
     subs    = [fi for fi in all_infos if not fi['is_master']]
     masters = [fi for fi in all_infos if fi['is_master']]
 
     out: list[CalSource] = []
+
+    def add_series(files: list[dict], kind: str, qualifier: str,
+                   nice: str, detail: str = '', filt: str = ''):
+        """Append one entry per capture series, if the group splits at all."""
+        batches = cluster_by_time(files, batch_gap_hours)
+        if not 2 <= len(batches) <= MAX_BATCHES_PER_GROUP:
+            return
+        for part in batches:
+            t_start, t_end = batch_range(part)
+            key  = batch_key_of(part)
+            bits = [nice, format_span(t_start, t_end)]
+            if detail:
+                bits.append(detail)
+            bits.append(f'{len(part)} frames')
+            out.append(CalSource(
+                sid=batch_sid(kind, key, qualifier),
+                kind=kind,
+                label=' · '.join(bits),
+                session=part[0]['session'], filt=filt,
+                exptime=_common_exptime(part), files=part,
+                batch=key, t_start=t_start, t_end=t_end))
 
     # ── Raw sub groups ───────────────────────────────────────────────────────
     # bias: one pooled entry (upstream pools them too) + one per night
@@ -611,7 +786,8 @@ def enumerate_cal_sources(all_infos: list[dict],
             sid=subs_sid('bias', ANY_SESSION),
             kind='bias',
             label=f'Bias subs · all nights · {len(bias)} frames',
-            session=ANY_SESSION, files=list(bias)))
+            session=ANY_SESSION, files=list(bias),
+            **dict(zip(('t_start', 't_end'), batch_range(bias)))))
         by_sess: dict = defaultdict(list)
         for fi in bias:
             by_sess[fi['session']].append(fi)
@@ -621,7 +797,11 @@ def enumerate_cal_sources(all_infos: list[dict],
                     sid=subs_sid('bias', sess),
                     kind='bias',
                     label=f'Bias subs · {sess} · {len(by_sess[sess])} frames',
-                    session=sess, files=list(by_sess[sess])))
+                    session=sess, files=list(by_sess[sess]),
+                    **dict(zip(('t_start', 't_end'),
+                               batch_range(by_sess[sess])))))
+        for sess in sorted(by_sess):
+            add_series(by_sess[sess], 'bias', '', 'Bias subs')
 
     # darks and dark-flats: grouped by exposure, pooled and per night
     for kind in ('dark', 'darkflat'):
@@ -634,8 +814,7 @@ def enumerate_cal_sources(all_infos: list[dict],
             by_exp[_exptime_key(fi.get('exptime'))].append(fi)
         for exp_key in sorted(by_exp, key=_exptime_sort_key):
             group = by_exp[exp_key]
-            exptime = next((fi['exptime'] for fi in group
-                            if fi.get('exptime') is not None), None)
+            exptime = _common_exptime(group)
             sessions = sorted({fi['session'] for fi in group})
             # Pooled across nights — the entry that makes a dark library work
             out.append(CalSource(
@@ -643,7 +822,8 @@ def enumerate_cal_sources(all_infos: list[dict],
                 kind=kind,
                 label=(f'{nice} subs · all nights · {exp_key} · '
                        f'{len(group)} frames'),
-                session=ANY_SESSION, exptime=exptime, files=list(group)))
+                session=ANY_SESSION, exptime=exptime, files=list(group),
+                **dict(zip(('t_start', 't_end'), batch_range(group)))))
             if len(sessions) > 1:
                 for sess in sessions:
                     part = [fi for fi in group if fi['session'] == sess]
@@ -652,7 +832,11 @@ def enumerate_cal_sources(all_infos: list[dict],
                         kind=kind,
                         label=(f'{nice} subs · {sess} · {exp_key} · '
                                f'{len(part)} frames'),
-                        session=sess, exptime=exptime, files=part))
+                        session=sess, exptime=exptime, files=part,
+                        **dict(zip(('t_start', 't_end'), batch_range(part)))))
+            for sess in sessions:
+                part = [fi for fi in group if fi['session'] == sess]
+                add_series(part, kind, exp_key, f'{nice} subs', detail=exp_key)
 
     # flats: grouped by night and filter (a flat is only valid for its own
     # optical train, so there is no useful pooled entry here)
@@ -668,9 +852,10 @@ def enumerate_cal_sources(all_infos: list[dict],
             label=(f'Flat subs · {sess} · {_filt_label(filt)} · '
                    f'{len(group)} frames'),
             session=sess, filt=filt,
-            exptime=next((fi['exptime'] for fi in group
-                          if fi.get('exptime') is not None), None),
-            files=group))
+            exptime=_common_exptime(group), files=group,
+            **dict(zip(('t_start', 't_end'), batch_range(group)))))
+        add_series(group, 'flat', _safe_name(filt), 'Flat subs',
+                   detail=_filt_label(filt), filt=filt)
 
     # ── Ready-made files: pre-existing masters ───────────────────────────────
     for fi in sorted(masters, key=lambda x: x['name']):
@@ -755,6 +940,7 @@ class PreprocessingEngine:
         drizzle_pixfrac:  float = 1.0,
         assignments:      Optional[dict] = None,
         strict_assignment: bool = False,
+        batch_gap_hours:  float = DEFAULT_BATCH_GAP_H,
         progress_cb:     Optional[Callable] = None,
     ):
         self.siril           = siril
@@ -813,7 +999,8 @@ class PreprocessingEngine:
         # Every source the user could have pointed at, by ID.
         self._sources: dict[str, CalSource] = {
             src.sid: src
-            for src in enumerate_cal_sources(all_infos, external_darks)
+            for src in enumerate_cal_sources(all_infos, external_darks,
+                                             batch_gap_hours)
         }
         # sid → master file, filled while phases 1-3 run.
         self._registry: dict[str, Path] = {}
@@ -993,6 +1180,9 @@ class PreprocessingEngine:
         """
         sess = 'all' if src.session in ('', ANY_SESSION) else src.session
         bits = ['cal', src.kind, sess]
+        if src.batch:
+            # Two series of the same night must not overwrite each other.
+            bits.append(src.batch)
         if src.kind in ('dark', 'darkflat') and src.exptime is not None:
             bits.append(_exptime_key(src.exptime))
         if src.kind == 'flat':
@@ -1057,7 +1247,8 @@ class PreprocessingEngine:
         # Resolve that bias *before* changing directory: resolving it may build
         # another master, which cd's somewhere else and would leave the
         # convert/calibrate below running in the wrong working directory.
-        cal_bias = (self._flat_bias_arg(src.session, src.filt, src.exptime)
+        cal_bias = (self._flat_bias_arg(src.session, src.filt, src.exptime,
+                                        flat_sid=src.sid)
                     if src.kind == 'flat' else None)
 
         stem    = self._sid_stem(src)
@@ -1158,9 +1349,20 @@ class PreprocessingEngine:
         return _qflag(flag, path)
 
     def _flat_bias_arg(self, session: str, filt: str,
-                       flat_exptime: Optional[float]) -> Optional[str]:
-        """Bias (or dark-flat) used to calibrate one flat group before stacking."""
-        grp = self._flats_assign.get(flat_group_key(session, filt), {})
+                       flat_exptime: Optional[float],
+                       flat_sid: Optional[str] = None) -> Optional[str]:
+        """
+        Bias (or dark-flat) used to calibrate one flat group before stacking.
+
+        Looked up by the flat source's own ID first, then by (night, filter).
+        The source ID is what separates two flat series of the same night —
+        the group key alone cannot tell them apart.
+        """
+        grp = None
+        if flat_sid:
+            grp = self._flats_assign.get(flat_sid)
+        if not isinstance(grp, dict):
+            grp = self._flats_assign.get(flat_group_key(session, filt), {})
         sid = grp.get('bias') if isinstance(grp, dict) else None
         return self._resolve_cal(
             '-bias', sid,
@@ -1720,7 +1922,9 @@ class PreprocessingEngine:
                 )
                 # Manual assignment first; otherwise the upstream chain
                 # (master bias → dark flat matched by exposure time).
-                cal_bias_arg = self._flat_bias_arg(session, filt, flat_exptime)
+                cal_bias_arg = self._flat_bias_arg(
+                    session, filt, flat_exptime,
+                    flat_sid=subs_sid('flat', session, filt_safe))
 
                 seq_dir = self.proc_dir / f'session_{session}' / f'flat_{filt_safe}'
                 self._copy_files(flat_files, seq_dir)
@@ -2329,7 +2533,8 @@ class OptionsDialog(QDialog):
     def __init__(self, parent, use_bkg: bool, use_disto: bool,
                  use_drizzle: bool, drizzle_scale: float, drizzle_pixfrac: float,
                  use_nearest_flat: bool = False, keep_masters: bool = True,
-                 strict_assignment: bool = False):
+                 strict_assignment: bool = False,
+                 batch_gap_hours: float = DEFAULT_BATCH_GAP_H):
         super().__init__(parent)
         self.setWindowTitle('Pipeline Options')
         self.setMinimumWidth(440)
@@ -2389,6 +2594,34 @@ class OptionsDialog(QDialog):
             'wrong automatic match is worse for you than no calibration at all.'
         )
         lay.addWidget(self.chk_strict)
+
+        # ── Series detection ─────────────────────────────────────────────
+        gap_row = QWidget()
+        gap_lay = QHBoxLayout(gap_row)
+        gap_lay.setContentsMargins(0, 0, 0, 0)
+        gap_lay.setSpacing(8)
+        gap_lbl = QLabel('Serien trennen ab einer Aufnahmelücke von')
+        gap_lay.addWidget(gap_lbl)
+        self.spin_gap = QDoubleSpinBox()
+        self.spin_gap.setRange(0.1, 48.0)
+        self.spin_gap.setDecimals(1)
+        self.spin_gap.setSingleStep(0.5)
+        self.spin_gap.setValue(batch_gap_hours)
+        self.spin_gap.setSuffix(' h')
+        self.spin_gap.setFixedWidth(90)
+        gap_lay.addWidget(self.spin_gap)
+        gap_lay.addStretch()
+        gap_tip = (
+            'Kalibrierungs-Frames werden zusätzlich zur Nacht in Serien\n'
+            'aufgeteilt: zusammenhängende Aufnahmeläufe, getrennt an\n'
+            'Lücken über diesem Wert.\n\n'
+            'Nötig, weil eine Nacht von 12 bis 12 Uhr läuft: Flats vom\n'
+            'Abend des 14. und Flats vom Morgen des 15. sind dieselbe\n'
+            'Nacht, aber zwei getrennte Sätze.'
+        )
+        gap_lbl.setToolTip(gap_tip)
+        self.spin_gap.setToolTip(gap_tip)
+        lay.addWidget(gap_row)
 
         # ── Keep masters ─────────────────────────────────────────────────
         self.chk_keep_masters = QCheckBox('Save master frames to output/masters/')
@@ -2476,6 +2709,10 @@ class OptionsDialog(QDialog):
     @property
     def strict_assignment(self) -> bool:
         return self.chk_strict.isChecked()
+
+    @property
+    def batch_gap_hours(self) -> float:
+        return self.spin_gap.value()
 
     @property
     def use_drizzle(self) -> bool:
@@ -2794,18 +3031,20 @@ class CalibrationWizard(QDialog):
     PAGES = ['1 · Lights', '2 · Kalibrierung', '3 · Zuordnung', '4 · Prüfung']
 
     # Defaults for the two plausibility checks the user asked for.
-    DEFAULT_EXP_TOL_S   = 5.0   # dark vs light exposure time
-    DEFAULT_DATE_TOL_D  = 1     # flat night vs light night
+    DEFAULT_EXP_TOL_S   = 5.0    # dark vs light exposure time
+    DEFAULT_DATE_TOL_H  = 24.0   # flat series vs the night's lights, in hours
 
     _TABLE_QSS = CalibrationAssignmentDialog._TABLE_QSS
 
     def __init__(self, parent, all_infos: list[dict],
                  external_darks: Optional[Path] = None,
-                 synthetic_bias: str = ''):
+                 synthetic_bias: str = '',
+                 batch_gap_hours: float = DEFAULT_BATCH_GAP_H):
         super().__init__(parent)
         self.setWindowTitle('Custom AMSP – Kalibrierungs-Assistent')
         self.setMinimumSize(1080, 700)
 
+        self._batch_gap_hours = batch_gap_hours
         self._external_darks = external_darks
         self._synthetic_bias = synthetic_bias.strip()
         self._infos: list[dict] = list(all_infos)
@@ -2977,7 +3216,7 @@ class CalibrationWizard(QDialog):
 
         self._calib_table = QTableWidget(0, 4)
         self._calib_table.setHorizontalHeaderLabels(
-            ['Art', 'Nacht', 'Details', 'Frames'])
+            ['Art', 'Aufnahmeserie', 'Details', 'Frames'])
         self._prepare_table(self._calib_table)
         lay.addWidget(self._calib_table, stretch=1)
 
@@ -2999,7 +3238,7 @@ class CalibrationWizard(QDialog):
 
     def _refresh_calibration_page(self):
         rows: list[tuple[str, str, str, int]] = []
-        counts: dict = defaultdict(int)
+        groups: dict = defaultdict(list)
         for fi in self._infos:
             if fi['is_master'] or fi['imgtype'] == 'light':
                 continue
@@ -3010,11 +3249,16 @@ class CalibrationWizard(QDialog):
                 detail = _exptime_key(fi.get('exptime'))
             else:
                 detail = ''
-            counts[(kind, fi['session'], detail)] += 1
+            groups[(kind, fi['session'], detail)].append(fi)
 
-        for (kind, session, detail), n in sorted(counts.items()):
+        # One row per capture series so two runs inside the same night are
+        # visible as two runs instead of one lump.
+        for (kind, session, detail), files in sorted(groups.items()):
             label = TYPE_INFO.get(kind, (kind, ''))[0]
-            rows.append((label, session, detail, n))
+            for part in cluster_by_time(files, self._batch_gap_hours):
+                t_start, t_end = batch_range(part)
+                rows.append((label, format_span(t_start, t_end), detail,
+                             len(part)))
 
         masters = [fi for fi in self._infos if fi['is_master']]
         for fi in sorted(masters, key=lambda x: x['name']):
@@ -3056,10 +3300,17 @@ class CalibrationWizard(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        self._assign_table = QTableWidget(0, 6)
+        self._assign_table = QTableWidget(0, 7)
         self._assign_table.setHorizontalHeaderLabels(
-            ['Nacht', 'Lights', 'Bias', 'Dark', 'Dark-Flat', 'Flat'])
+            ['Nacht', 'Lights', 'Bias', 'Dark', 'Dark-Flat', 'Flat',
+             'Flat-Abstand'])
         self._prepare_table(self._assign_table, stretch_from=2)
+        self._assign_table.horizontalHeader().setSectionResizeMode(
+            6, QHeaderView.ResizeMode.ResizeToContents)
+        self._assign_table.horizontalHeaderItem(6).setToolTip(
+            'Zeitabstand zwischen der gewählten Flat-Serie und den Lights\n'
+            'dieser Nacht. Klein ist gut; große Werte bedeuten, dass die\n'
+            'Flats aus einer anderen Sitzung stammen.')
         self._assign_table.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection)
         self._assign_table.setSelectionBehavior(
@@ -3096,7 +3347,8 @@ class CalibrationWizard(QDialog):
         """Rebuild the per-night rows, keeping choices the user already made."""
         previous = {night: {k: cb.currentData() for k, cb in combos.items()}
                     for night, combos in self._night_rows}
-        self._sources = enumerate_cal_sources(self._infos, self._external_darks)
+        self._sources = enumerate_cal_sources(
+            self._infos, self._external_darks, self._batch_gap_hours)
         nights = sorted({fi['session'] for fi in self._infos
                          if not fi['is_master'] and fi['imgtype'] == 'light'})
 
@@ -3125,9 +3377,27 @@ class CalibrationWizard(QDialog):
             for col, kind in enumerate(('bias', 'dark', 'darkflat', 'flat'),
                                        start=2):
                 self._assign_table.setCellWidget(row, col, combos[kind])
+            combos['flat'].currentIndexChanged.connect(self._update_gap_cells)
             self._night_rows.append((night, combos))
 
         self._fill_suggestions()
+        self._update_gap_cells()
+
+    def _update_gap_cells(self):
+        """Show how far the chosen flat series sits from each night's lights."""
+        by_sid = {s.sid: s for s in self._sources}
+        for row, (night, combos) in enumerate(self._night_rows):
+            src = by_sid.get(combos['flat'].currentData())
+            gap = self._gap_to_night(src, night) if src else None
+            if gap is None:
+                text, color = '–', '#666677'
+            else:
+                text = format_hours(gap)
+                color = ('#7ED987' if gap <= 12 else
+                         '#FFB347' if gap <= self.DEFAULT_DATE_TOL_H else '#FF7070')
+            cell = self._ro_cell(text)
+            cell.setForeground(QColor(color))
+            self._assign_table.setItem(row, 6, cell)
 
     def _fill_suggestions(self, force: bool = False):
         """
@@ -3158,10 +3428,12 @@ class CalibrationWizard(QDialog):
         if kind == 'dark':
             want = [fi['exptime'] for fi in lights if fi.get('exptime') is not None]
             target = max(set(want), key=want.count) if want else None
+            darks = [s for s in self._sources if s.kind == 'dark']
+            # Darks do not suffer from the two-series-per-night problem, so
+            # the pooled and per-night entries stay the better default.
+            whole = [s for s in darks if not s.is_batch]
             best, best_delta = None, float('inf')
-            for s in self._sources:
-                if s.kind != 'dark':
-                    continue
+            for s in (whole or darks):
                 if target is None or s.exptime is None:
                     if best is None:
                         best = s.sid
@@ -3174,14 +3446,19 @@ class CalibrationWizard(QDialog):
             return best
 
         if kind == 'flat':
-            best, best_delta = None, None
-            for s in self._sources:
-                if s.kind != 'flat':
-                    continue
-                delta = session_delta_days(night, s.session)
-                score = abs(delta) if delta is not None else 10 ** 6
-                if best_delta is None or score < best_delta:
-                    best, best_delta = s.sid, score
+            # Prefer capture series over whole-night groups: when a night
+            # holds two flat runs, picking "the night" would stack both into
+            # one master, which is exactly what has to be avoidable here.
+            candidates = [s for s in self._sources if s.kind == 'flat']
+            series = [s for s in candidates if s.is_batch]
+            if series:
+                candidates = series
+            best, best_score = None, None
+            for s in candidates:
+                gap = self._gap_to_night(s, night)
+                score = gap if gap is not None else float('inf')
+                if best_score is None or score < best_score:
+                    best, best_score = s.sid, score
             return best
 
         if kind == 'darkflat':
@@ -3210,6 +3487,21 @@ class CalibrationWizard(QDialog):
                 return bias
             return best or bias
         return None
+
+    def _night_time_range(self, night: str):
+        """First and last light frame of one night."""
+        lights = [fi for fi in self._infos
+                  if not fi['is_master'] and fi['imgtype'] == 'light'
+                  and fi['session'] == night]
+        return batch_range(lights)
+
+    def _gap_to_night(self, src: CalSource, night: str) -> Optional[float]:
+        """Hours between a calibration source and that night's lights."""
+        n_start, n_end = self._night_time_range(night)
+        s_start, s_end = src.t_start, src.t_end
+        if s_start is None and src.files:
+            s_start, s_end = batch_range(src.files)
+        return interval_gap_hours(n_start, n_end, s_start, s_end)
 
     def _apply_to_all_nights(self, kind: str):
         """Copy the selected row's choice for one kind to every night."""
@@ -3247,16 +3539,19 @@ class CalibrationWizard(QDialog):
         tol.addWidget(self._spin_exp_tol)
 
         tol.addSpacing(16)
-        tol.addWidget(QLabel('Toleranz Flat-Datum:'))
-        self._spin_date_tol = QSpinBox()
-        self._spin_date_tol.setRange(0, 365)
-        self._spin_date_tol.setValue(self.DEFAULT_DATE_TOL_D)
-        self._spin_date_tol.setSuffix(' Tage')
+        tol.addWidget(QLabel('Toleranz Flat-Abstand:'))
+        self._spin_date_tol = QDoubleSpinBox()
+        self._spin_date_tol.setRange(0.0, 8760.0)
+        self._spin_date_tol.setDecimals(1)
+        self._spin_date_tol.setSingleStep(6.0)
+        self._spin_date_tol.setValue(self.DEFAULT_DATE_TOL_H)
+        self._spin_date_tol.setSuffix(' h')
         self._spin_date_tol.setFixedWidth(90)
         self._spin_date_tol.setToolTip(
-            'Wie weit das Flat von der Nacht der Lights entfernt sein darf.\n'
-            'Ein Flat vom 15.08. gehört nicht zur Nacht vom 13. auf den 14.,\n'
-            'ein Flat vom Nachmittag des 14. dagegen schon.')
+            'Zeitabstand zwischen der Flat-Serie und den Lights dieser Nacht.\n'
+            'Gemessen wird von Ende zu Anfang, nicht über Kalendertage: eine\n'
+            'Flat-Serie am Morgen nach der Nacht ist wenige Stunden entfernt,\n'
+            'eine Serie zwei Tage später fällt deutlich heraus.')
         self._spin_date_tol.valueChanged.connect(self._refresh_check_page)
         tol.addWidget(self._spin_date_tol)
         tol.addStretch()
@@ -3355,21 +3650,24 @@ class CalibrationWizard(QDialog):
                                 f'({target:.1f} s) ab – erlaubt sind '
                                 f'±{exp_tol:.0f} s.'))
 
-                # ── Datum: Flat gegen die Nacht der Lights ────────────────
-                if kind == 'flat' and src.session:
-                    delta = session_delta_days(night, src.session)
-                    if delta is None:
+                # ── Zeitabstand: Flat-Serie gegen die Lights dieser Nacht ──
+                # Gemessen von Intervall zu Intervall statt über Nacht-
+                # Schlüssel: zwei Flat-Serien derselben Nacht liessen sich
+                # über den Kalendertag gar nicht unterscheiden.
+                if kind == 'flat':
+                    gap = self._gap_to_night(src, night)
+                    if gap is None:
                         out.append(('warn', night,
-                                    'Flat: Aufnahmedatum unbekannt – die '
-                                    'Zuordnung lässt sich nicht prüfen.'))
-                    elif abs(delta) > date_tol:
-                        direction = 'nach' if delta > 0 else 'vor'
+                                    'Flat: Aufnahmezeit unbekannt – der Abstand '
+                                    'zu den Lights lässt sich nicht prüfen.'))
+                    elif gap > date_tol:
+                        when = format_span(src.t_start, src.t_end)
                         out.append((
                             'warn', night,
-                            f'Flat vom {src.session} liegt {abs(delta)} Tage '
-                            f'{direction} der Nacht {night} – erlaubt sind '
-                            f'{date_tol} Tag(e). Ein Flat von einem anderen Tag '
-                            f'passt nur, wenn der optische Aufbau unverändert war.'))
+                            f'Flat-Serie {when} liegt {format_hours(gap)} von '
+                            f'den Lights dieser Nacht entfernt – erlaubt sind '
+                            f'{format_hours(date_tol)}. Das passt nur, wenn der '
+                            f'optische Aufbau dazwischen unverändert war.'))
 
             if not lights:
                 out.append(('info', night, 'Keine Lights in dieser Nacht.'))
@@ -3566,10 +3864,17 @@ class CalibrationWizard(QDialog):
             # The dark flat calibrates the flats themselves, so it is stored
             # against the flat group the chosen flat source stands for.
             df = picked.get('darkflat')
-            flat_src = by_sid.get(picked.get('flat'))
+            flat_sid = picked.get('flat')
+            flat_src = by_sid.get(flat_sid)
             if df and df != SID_AUTO and flat_src is not None and flat_src.files:
-                for fi in flat_src.files:
-                    flats_tbl[flat_group_key(fi['session'], fi['filter'])] = {'bias': df}
+                # Keyed by the source ID: two flat series of the same night
+                # share a (night, filter) group key and would overwrite each
+                # other, so the ID is what keeps them apart.
+                flats_tbl[flat_sid] = {'bias': df}
+                if not flat_src.is_batch:
+                    for fi in flat_src.files:
+                        flats_tbl[flat_group_key(fi['session'],
+                                                 fi['filter'])] = {'bias': df}
 
         return {'lights': lights_tbl, 'flats': flats_tbl}
 
@@ -3595,6 +3900,7 @@ class FITSOrganizerWindow(QMainWindow):
         # Manual calibration assignment: group key → {kind: source ID}
         self._assignments: dict = {'lights': {}, 'flats': {}}
         self._strict_assignment: bool = False
+        self._batch_gap_hours: float = DEFAULT_BATCH_GAP_H
 
         self.siril = s.SirilInterface()
         try:
@@ -3872,7 +4178,7 @@ class FITSOrganizerWindow(QMainWindow):
             self, self._use_bkg, self._use_disto,
             self._use_drizzle, self._drizzle_scale, self._drizzle_pixfrac,
             self._use_nearest_flat, self._keep_masters,
-            self._strict_assignment,
+            self._strict_assignment, self._batch_gap_hours,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._use_bkg          = dlg.use_bkg
@@ -3883,7 +4189,12 @@ class FITSOrganizerWindow(QMainWindow):
             self._use_nearest_flat = dlg.use_nearest_flat
             self._keep_masters     = dlg.keep_masters
             self._strict_assignment = dlg.strict_assignment
+            previous_gap = self._batch_gap_hours
+            self._batch_gap_hours = dlg.batch_gap_hours
             self._save_config()
+            if previous_gap != self._batch_gap_hours and self._all_infos:
+                # the tree groups calibration frames by series, so redraw it
+                self._build_tree(self._all_infos)
 
     def _show_assignment(self):
         """Open the manual light ↔ calibration mapping dialog."""
@@ -3914,7 +4225,7 @@ class FITSOrganizerWindow(QMainWindow):
         if self._proc_worker and self._proc_worker.isRunning():
             return
         dlg = CalibrationWizard(self, self._all_infos, self._external_darks,
-                                self.bias_input.text())
+                                self.bias_input.text(), self._batch_gap_hours)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -3972,6 +4283,7 @@ class FITSOrganizerWindow(QMainWindow):
             'drizzle_scale':      self._drizzle_scale,
             'drizzle_pixfrac':    self._drizzle_pixfrac,
             'strict_assignment':  self._strict_assignment,
+            'batch_gap_hours':    self._batch_gap_hours,
             # Source IDs are stable across restarts, so a project processed
             # again later keeps the mapping that was corrected by hand.
             'assignments':        self._assignments,
@@ -4027,6 +4339,11 @@ class FITSOrganizerWindow(QMainWindow):
         self._drizzle_scale    = float(cfg.get('drizzle_scale',   1.0))
         self._drizzle_pixfrac  = float(cfg.get('drizzle_pixfrac', 1.0))
         self._strict_assignment = bool(cfg.get('strict_assignment', False))
+        try:
+            self._batch_gap_hours = float(
+                cfg.get('batch_gap_hours', DEFAULT_BATCH_GAP_H))
+        except (TypeError, ValueError):
+            self._batch_gap_hours = DEFAULT_BATCH_GAP_H
 
         # Manual assignments – a hand-edited or truncated config must never
         # stop the window from opening, so every level is type-checked.
@@ -4322,6 +4639,7 @@ class FITSOrganizerWindow(QMainWindow):
             drizzle_pixfrac  = self._drizzle_pixfrac,
             assignments      = self._assignments,
             strict_assignment= self._strict_assignment,
+            batch_gap_hours  = self._batch_gap_hours,
         )
 
         self._proc_worker = ProcessingWorker(engine)
@@ -4516,8 +4834,9 @@ class FITSOrganizerWindow(QMainWindow):
                                 f_item.setText(0, lbl)
                                 f_item.setText(1, str(len(files)))
                                 f_item.setForeground(1, color_muted)
-                                _populate_sub_master(
-                                    f_item, {False: files}, font_bold, color_muted)
+                                _populate_series(
+                                    f_item, files, font_bold, color_muted,
+                                    self._batch_gap_hours)
                         elif imgtype == 'dark':
                             # Exposure sub-nodes (sorted numerically by exptime)
                             for exp_key in sorted(filts.keys(), key=_exptime_sort_key):
@@ -4529,13 +4848,15 @@ class FITSOrganizerWindow(QMainWindow):
                                 e_item.setText(0, lbl)
                                 e_item.setText(1, str(len(files)))
                                 e_item.setForeground(1, color_muted)
-                                _populate_sub_master(
-                                    e_item, {False: files}, font_bold, color_muted)
+                                _populate_series(
+                                    e_item, files, font_bold, color_muted,
+                                    self._batch_gap_hours)
                         else:
                             # Fallback for any future session-specific type
                             all_files = [fi for fl in filts.values() for fi in fl]
-                            _populate_sub_master(
-                                s_item, {False: all_files}, font_bold, color_muted)
+                            _populate_series(
+                                s_item, all_files, font_bold, color_muted,
+                                self._batch_gap_hours)
 
                 elif imgtype in calib_by_type_flat:
                     # ── Camera-wide type (bias, unknown): no session node ────
@@ -4548,7 +4869,8 @@ class FITSOrganizerWindow(QMainWindow):
                     t_item.setForeground(1, color_muted)
 
                     all_files = [fi for fl in filts.values() for fi in fl]
-                    _populate_sub_master(t_item, {False: all_files}, font_bold, color_muted)
+                    _populate_series(t_item, all_files, font_bold, color_muted,
+                                     self._batch_gap_hours)
 
             # depth=3 opens: Calibration → type → night (→ filter for flats)
             _expand(cal_root, depth=3)
@@ -4581,6 +4903,34 @@ class FITSOrganizerWindow(QMainWindow):
 # =============================================================================
 # Tree helpers
 # =============================================================================
+
+def _populate_series(parent, files, font_bold, color_muted,
+                     gap_hours=DEFAULT_BATCH_GAP_H):
+    """
+    Insert a capture-series level below *parent*, then the file leaves.
+
+    Without this, two sets of flats taken on either side of the same night
+    (evening and the following morning) look like one single set, because the
+    noon-to-noon night key cannot tell them apart.  The level is only added
+    when the frames really do split into series.
+    """
+    batches = cluster_by_time(files, gap_hours)
+    if len(batches) < 2:
+        _populate_sub_master(parent, {False: files}, font_bold, color_muted)
+        return
+    for part in batches:
+        t_start, t_end = batch_range(part)
+        node = QTreeWidgetItem(parent)
+        node.setText(0, f'🕘  Series {format_span(t_start, t_end)}')
+        node.setText(1, str(len(part)))
+        node.setFont(0, font_bold)
+        node.setForeground(0, QColor('#88DDBB'))
+        node.setForeground(1, color_muted)
+        if t_start is not None:
+            node.setText(4, part[0].get('date_obs', ''))
+            node.setForeground(4, QColor('#555555'))
+        _populate_sub_master(node, {False: part}, font_bold, color_muted)
+
 
 def _populate_sub_master(parent, fmap, font_bold, color_muted):
     for is_master in (False, True):

@@ -21,6 +21,7 @@ Die automatische Zuordnung scheitert regelmäßig bei:
 | Session über lokal 12 Uhr hinweg | eine Nacht wird in zwei Sessions zerlegt |
 | Falsche oder fehlende `DATE-OBS` (z. B. Kamera-Uhr falsch gestellt) | Zuordnung praktisch zufällig |
 | Zwei Setups in derselben Nacht | Flats des einen Setups landen bei den Lights des anderen |
+| Zwei Flat-Läufe in einem Ordner (Abend + nächster Morgen) | beide fallen in dasselbe 12-bis-12-Uhr-Fenster und werden zu **einem** Satz verschmolzen |
 
 In allen Fällen läuft die Pipeline scheinbar sauber durch – kalibriert wird
 aber mit den falschen Frames oder gar nicht.
@@ -44,6 +45,26 @@ welches Dark-Flat sie kalibriert.
 **Jede Zeile steht anfangs auf „Auto"** – das ist exakt das bisherige
 Verhalten. Der Dialog ändert nichts, solange nichts umgestellt wird.
 
+### Aufnahmeserien: die Nacht ist zu grob
+
+Eine Nacht läuft von 12 bis 12 Uhr. Flats vom 14.08. um 18:54 und Flats vom
+15.08. um 06:12 liegen beide in diesem Fenster – nach Nacht-Logik derselbe
+Satz, in Wirklichkeit zwei Läufe für zwei verschiedene Nächte.
+
+Custom AMSP teilt Kalibrierungs-Frames deshalb zusätzlich in **Serien** auf:
+zusammenhängende Aufnahmeläufe, getrennt an Lücken über einem einstellbaren
+Schwellwert (Standard 2 h). Jede Serie ist eine eigene Quelle:
+
+```
+Flat subs · 2026-08-14 · no filter · 60 frames              ← ganze Nacht
+Flat subs · 2026-08-14 18:54 – 18:58 · no filter · 30 frames  ← Serie
+Flat subs · 2026-08-15 06:12 – 06:16 · no filter · 30 frames  ← Serie
+```
+
+Die Baumansicht zeigt die Serien-Ebene, sobald eine Gruppe zerfällt – man
+sieht also sofort, dass es zwei Läufe sind. Wo nichts zerfällt, ändert sich
+nichts: ein einzelner Aufnahmelauf sieht aus wie bisher.
+
 ### Kernpunkt: Quellen haben stabile IDs, kein Datum
 
 Jede Kalibrierungsquelle bekommt eine ID, die nicht aus dem Aufnahmezeitpunkt
@@ -54,6 +75,7 @@ abgeleitet wird:
 | `subs:dark:*:300s` | alle 300-s-Darks, **egal aus welcher Nacht** (Dark-Bibliothek) |
 | `subs:dark:2026-01-05:300s` | nur die Darks dieser einen Nacht |
 | `subs:flat:2026-03-25:Ha` | die Ha-Flats dieser Nacht |
+| `batch:flat:2026-08-14T18:54:nofilter` | **eine** Flat-Serie, über ihren Startzeitpunkt identifiziert |
 | `subs:bias:*:` | alle Bias-Frames |
 | `file:/pfad/master-dark.fit` | ein fertiger Master oder eine Datei aus dem „External darks"-Ordner |
 | `__synthetic__` | der synthetische Bias-Ausdruck aus dem Hauptfenster |
@@ -99,8 +121,13 @@ jede Nacht gelten soll.
 |---|---|---|
 | Belichtungszeit Dark ↔ Lights | ±5 s | „Dark: Belichtungszeit 240,0 s weicht um 60,0 s von den Lights ab" |
 | Belichtungszeit Dark-Flat ↔ Flats | ±5 s | dito, bezogen auf die Flats |
-| Datum Flat ↔ Nacht der Lights | ±1 Tag | „Flat vom 2026-08-15 liegt 2 Tage nach der Nacht 2026-08-13" |
+| Zeitabstand Flat-Serie ↔ Lights der Nacht | ±24 h | „Flat-Serie 2026-08-16 19:00 – 19:09 liegt 3,7 Tage von den Lights dieser Nacht entfernt" |
 | Zeile steht noch auf „Auto" | – | Hinweis, dass wieder das Aufnahmedatum entscheidet |
+
+Der Zeitabstand wird von Intervall zu Intervall gemessen, nicht über
+Kalendertage – nur so lassen sich zwei Serien derselben Nacht überhaupt
+unterscheiden. Flats vom nächsten Abend liegen dadurch klar innerhalb der
+Toleranz, Flats von übermorgen klar außerhalb.
 
 Beide Toleranzen sind im Dialog einstellbar. Warnungen blockieren nicht, müssen
 aber ausdrücklich bestätigt werden – ein Flat von einem anderen Tag kann passen,
@@ -164,10 +191,11 @@ pip install astropy numpy PyQt6
 python3 tests/run_all.py
 ```
 
-86 Tests: Quellen-Enumeration, Zuordnungs-Auflösung, Strict-Modus, Fallback bei
+117 Tests: Serien-Erkennung, Quellen-Enumeration, Zuordnungs-Auflösung, Strict-Modus, Fallback bei
 fehlenden Dateien, Konfigurations-Round-Trip, beide Dialoge, alle vier
-Assistenten-Schritte, die Dateinamen-Regel für Dark-Flats und die beiden
-Plausibilitätsprüfungen. Ein Test hält ausdrücklich fest, dass die
+Assistenten-Schritte, die Dateinamen-Regel für Dark-Flats und die
+Plausibilitätsprüfungen. 29 Tests bauen auf genau dem Datensatz auf, bei dem
+zwei Flat-Läufe zu einem verschmolzen wurden. Ein Test hält ausdrücklich fest, dass die
 **automatische** Zuordnung das Flat aus einer anderen Nacht nicht findet – der
 Ausgangsbefund, den dieser Fork behebt.
 
@@ -204,3 +232,12 @@ button per kind, and finally check exposure times (±5 s by default) and flat
 dates (±1 day) before anything is applied. Dark flats are additionally
 recognised from the file name (darkflat / dark_flat / dark-flat / flat_dark
 and so on).
+
+Because a night runs noon to noon it is too coarse a unit for calibration
+frames — flats shot at 18:54 and flats shot at 06:12 the next morning are the
+same night by that rule. Custom AMSP therefore also groups frames into
+**capture series**, split wherever the gap exceeds a configurable threshold
+(2 h by default). Each series is a selectable source of its own, the file tree
+shows a series level wherever a group really splits, and the wizard measures
+the distance between a flat series and a night's lights interval to interval
+rather than comparing calendar days.
